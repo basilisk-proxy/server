@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry = Arc::new(RuntimeTelemetry::new());
 
     // Load configuration exclusively from Lua.
-    let (config, lua_runtime) = load_config_and_runtime(
+    let (config, lua_runtime, cache) = load_config_and_runtime(
         &lua_entrypoint,
         Arc::clone(&registry),
         Arc::clone(&connection_manager),
@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         connection_manager: Arc::clone(&connection_manager),
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
+        cache,
         telemetry,
     });
 

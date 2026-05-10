@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct GatewayConfig {
     pub server: ServerOptions,
     pub routing: RoutingOptions,
+    pub cache: CacheOptions,
     pub registry: RegistryOptions,
     pub security: SecurityOptions,
     pub observability: ObservabilityOptions,
@@ -32,6 +33,17 @@ pub struct TlsOptions {
 pub struct RoutingOptions {
     pub default_load_balancing_strategy: String,
     pub strip_prefix: bool,
+}
+
+/// Shared gateway cache provider selection and defaults.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CacheOptions {
+    pub enabled: bool,
+    pub provider: String,
+    pub key_prefix: String,
+    pub service_resolution_ttl_seconds: u64,
+    pub ttl_seconds: u64,
+    pub strategy: String,
 }
 
 /// Service-registry maintenance timing options.
@@ -81,6 +93,14 @@ impl Default for GatewayConfig {
             routing: RoutingOptions {
                 default_load_balancing_strategy: "ROUND_ROBIN".to_string(),
                 strip_prefix: false,
+            },
+            cache: CacheOptions {
+                enabled: true,
+                provider: "memory".to_string(),
+                key_prefix: "runtime".to_string(),
+                service_resolution_ttl_seconds: 300,
+                ttl_seconds: 300,
+                strategy: "lru".to_string(),
             },
             registry: RegistryOptions {
                 heartbeat_timeout_seconds: 30,

@@ -29,6 +29,12 @@ pub struct RegistrationResult {
     pub error_message: Option<String>,
 }
 
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistry {
     /// Creates an empty in-memory service registry.
     pub fn new() -> Self {

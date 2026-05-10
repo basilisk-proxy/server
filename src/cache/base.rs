@@ -1,6 +1,7 @@
 use super::in_memory::InMemoryCacheManager;
 use super::memcached::MemcachedCacheManager;
 use super::redis::RedisCacheManager;
+use anyhow::{anyhow, Result};
 
 /// Provider-agnostic cache strategy surface.
 ///
@@ -8,7 +9,7 @@ use super::redis::RedisCacheManager;
 /// Memcached. The trait intentionally groups several data-structure styles under
 /// one strategy interface so callers can switch providers without changing call
 /// sites.
-pub trait CacheProvider {
+pub trait CacheProvider: Send {
     /// Returns a string value for `key` when present and not expired.
     fn get(&self, key: &str) -> Option<String>;
 
@@ -134,16 +135,30 @@ pub trait CacheProvider {
 }
 
 impl dyn CacheProvider {
+    /// Returns the supported cache provider names.
+    pub fn supported_providers() -> &'static [&'static str] {
+        &["memory", "redis", "memcached"]
+    }
+
+    /// Creates a cache strategy for the named provider.
+    pub fn try_new(provider: &str) -> Result<Box<dyn CacheProvider>> {
+        match provider {
+            "redis" => Ok(Box::new(RedisCacheManager::new())),
+            "memcached" => Ok(Box::new(MemcachedCacheManager::new())),
+            "memory" => Ok(Box::new(InMemoryCacheManager::new())),
+            _ => Err(anyhow!(
+                "Unsupported cache provider: {}. Supported providers: {}",
+                provider,
+                Self::supported_providers().join(", ")
+            )),
+        }
+    }
+
     /// Creates a cache strategy for the named provider.
     ///
     /// Supported values are `memory`, `redis`, and `memcached`.
     pub fn new(provider: &str) -> Box<dyn CacheProvider> {
-        match provider {
-            "redis" => Box::new(RedisCacheManager::new()),
-            "memcached" => Box::new(MemcachedCacheManager::new()),
-            "memory" => Box::new(InMemoryCacheManager::new()),
-            _ => panic!("Unsupported cache provider: {}", provider),
-        }
+        Self::try_new(provider).unwrap_or_else(|err| panic!("{err}"))
     }
 }
 pub(super) fn apply_sort_options(mut values: Vec<String>, options: &str) -> Vec<String> {

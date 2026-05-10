@@ -19,5 +19,7 @@ mod base;
 mod in_memory;
 mod memcached;
 mod redis;
+mod runtime;
 
 pub use base::CacheProvider;
+pub use runtime::GatewayCache;

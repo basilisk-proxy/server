@@ -28,7 +28,7 @@ pub(super) struct MemcachedCacheManager {
 impl MemcachedCacheManager {
     pub(super) fn new() -> Self {
         let url = std::env::var("BASILISK_MEMCACHED_URL")
-            .unwrap_or_else(|_| "memcache://127.0.0.1:11211".to_string());
+            .unwrap_or("memcache://127.0.0.1:11211".to_string());
         Self {
             client: if memcached_endpoint_reachable(&url) {
                 Client::connect(url.as_str()).ok()
@@ -40,7 +40,7 @@ impl MemcachedCacheManager {
 
     fn get_raw(&self, key: &str) -> Option<String> {
         let client = self.client.as_ref()?;
-        client.get::<String>(key).unwrap_or_else(|_| None)
+        client.get::<String>(key).unwrap_or(None)
     }
 
     fn set_raw(&self, key: &str, value: &str, ttl: u32) -> bool {

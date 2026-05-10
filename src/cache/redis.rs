@@ -8,7 +8,7 @@ pub(super) struct RedisCacheManager {
 impl RedisCacheManager {
     pub(super) fn new() -> Self {
         let url = std::env::var("BASILISK_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+            .unwrap_or("redis://127.0.0.1:6379/".to_string());
         Self {
             client: Client::open(url).ok(),
         }

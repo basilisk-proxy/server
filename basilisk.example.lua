@@ -35,7 +35,7 @@ basilisk.service_bus.monitoring_enabled(true)
 basilisk.registry.bind_path("/api/orders", "orders-service")
 
 -- Example: middleware storing context and forwarding auth headers
-basilisk.proxy.use(function(req, res, next)
+basilisk.proxy.use(function(req, _, next)
   -- Perform authentication and store in context
   local auth_token = req.headers["authorization"]
   if auth_token then

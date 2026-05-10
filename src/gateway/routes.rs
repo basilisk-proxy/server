@@ -9,6 +9,8 @@ use axum::{
 use std::sync::Arc;
 use tracing::{info, warn};
 
+const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
+
 /// Registers a service instance in the in-memory registry.
 pub async fn register(
     State(state): State<Arc<AppState>>,
@@ -21,27 +23,30 @@ pub async fn register(
     );
 
     // 1. Authenticate Registration (FR-1)
-    if state.config.security.service_registration_auth == "TOKEN" {
-        if request.auth.r#type != "token"
-            || request.auth.token != state.config.security.registration_token
-        {
-            warn!("Authentication failed for service {}", request.service_id);
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: ErrorDetail {
-                        code: error_codes::AUTH_FAILED.to_string(),
-                        message: "Authentication failed for service registration".to_string(),
-                    },
-                }),
-            )
-                .into_response();
-        }
+    if state.config.security.service_registration_auth == "TOKEN" && request.auth.r#type != "token"
+        || request.auth.token != state.config.security.registration_token
+    {
+        warn!("Authentication failed for service {}", request.service_id);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: ErrorDetail {
+                    code: error_codes::AUTH_FAILED.to_string(),
+                    message: "Authentication failed for service registration".to_string(),
+                },
+            }),
+        )
+            .into_response();
     }
 
     let result = registry.register(request.clone()).await;
 
     if result.success {
+        if state.config.cache.enabled {
+            if let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1) {
+                warn!("failed to advance registry cache version after register: {err}");
+            }
+        }
         (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -82,6 +87,11 @@ pub async fn deregister(
     Path((service_id, instance_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     if state.registry.deregister(&service_id, &instance_id).await {
+        if state.config.cache.enabled {
+            if let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1) {
+                warn!("failed to advance registry cache version after deregister: {err}");
+            }
+        }
         StatusCode::OK.into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()

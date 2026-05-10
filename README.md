@@ -6,7 +6,7 @@ Basilisk is a programmable reverse proxy with three built-in control planes:
 - TCP service bus (publish/subscribe and forward requests)
 - Lua runtime for configuration and request middleware
 
-It also exposes a library-level cache strategy module with in-memory, Redis, and Memcached providers.
+It includes a shared gateway cache runtime (Lua + proxy internals) with memory, Redis, and Memcached providers.
 
 The runtime is configured from a single Lua entry file passed on process startup.
 
@@ -114,22 +114,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test -- --nocapture
 ```
 
-### Optional cache backends for library consumers
+### Optional cache backends
 
-The cache module is currently exposed as a Rust library API, not as a Lua/runtime primitive.
+The runtime cache provider can be selected from Lua via `basilisk.cache.provider(...)`.
 
 - `memory` works entirely in-process with no external dependency.
 - `redis` uses `BASILISK_REDIS_URL` and defaults to `redis://127.0.0.1:6379/`.
 - `memcached` uses `BASILISK_MEMCACHED_URL` and defaults to `memcache://127.0.0.1:11211`.
 
-Example:
+Example (`basilisk.lua`):
 
-```rust
-use basilisk::cache::CacheManager;
-
-let mut cache = <dyn CacheManager>::new("memory");
-cache.set("greeting", "hello".to_string());
-assert_eq!(cache.get("greeting").as_deref(), Some("hello"));
+```lua
+basilisk.cache.enabled(true)
+basilisk.cache.provider("memory")
+basilisk.cache.key_prefix("runtime")
+basilisk.cache.service_resolution_ttl_seconds(300)
 ```
 
 ## 5. Configuration (`basilisk.lua`)
@@ -168,6 +167,17 @@ basilisk.service_bus.port(5090)
 - `load_balancing_strategy(string)`
   - Supported values in proxy selection: `ROUND_ROBIN`, `WEIGHTED_ROUND_ROBIN`, `WEIGHTED_RANDOM`, `IP_HASH`
 - `strip_prefix(boolean)`
+
+`basilisk.cache`
+
+- `enabled(boolean)`
+- `provider(string)` - `memory`, `redis`, or `memcached`
+- `key_prefix(string)` - appended to Basilisk-owned internal namespace as `basilisk:gateway:<key_prefix>:...`
+- `service_resolution_ttl_seconds(number)` - TTL for proxy path-resolution cache entries
+- `ttl_seconds(number)` - compatibility alias for `service_resolution_ttl_seconds`
+- `strategy(string)`
+- `get(key)` / `set(key, value)` / `delete(key)` / `exists(key)` / `keys()`
+- list / set / hash helpers (`list_*`, `set_*`, `hash_*`) and numeric helpers (`incr`, `decr`)
 
 `basilisk.security`
 
@@ -546,11 +556,12 @@ Background task:
 - Use `type = "forward"` messages to request remote handling through the bus.
 - Receive structured `forward_response` payloads.
 
-### 10.4 Shared cache strategy for library consumers
+### 10.4 Gateway cache with Basilisk-owned internal keys
 
-- Use `basilisk::cache::CacheManager` when you need a backend-swappable cache abstraction.
-- Select `memory`, `redis`, or `memcached` at construction time.
-- Redis and Memcached backends are private concrete strategies behind the module boundary.
+- Configure cache behavior in Lua with `basilisk.cache.*`.
+- Proxy route-resolution results are cached under Basilisk-owned internal keys.
+- Internal keys are namespaced with `basilisk:gateway:<key_prefix>:...` and hidden from user-facing `basilisk.cache.keys()`.
+- User keys (for middleware/runtime use) remain unprefixed and do not collide with proxy internals.
 
 ## 11. Testing
 Top-level integration tests are in `tests/`:
@@ -569,7 +580,7 @@ cargo test -- --nocapture
 
 ## 12. Operational Notes
 - Registry and service buses are in-memory; state is not persisted across restarts.
-- The cache module is a library surface; it is not yet wired into the proxy/runtime configuration flow.
+- Cache is shared between Lua primitives and gateway internals through `AppState.cache`.
 - Redis and Memcached providers degrade to unavailable/no-op behavior when their backend cannot be reached.
 - Lua middleware runs in-process; panics or heavy logic can impact request latency.
 - `service_bus.max_message_chars` limits inbound line length per client message.

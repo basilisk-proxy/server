@@ -1,6 +1,7 @@
 pub mod proxy;
 pub mod routes;
 
+use crate::cache::GatewayCache;
 use crate::config::GatewayConfig;
 use crate::gateway::proxy::ProxyHandler;
 use crate::lua_config::LuaRuntime;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub proxy_handler: ProxyHandler,
     /// Lua runtime hosting request middlewares.
     pub lua_runtime: Arc<LuaRuntime>,
+    /// Shared gateway cache used by Lua primitives and proxy internals.
+    pub cache: Arc<GatewayCache>,
     /// Aggregated runtime telemetry (latencies + monitored service distributions).
     pub telemetry: Arc<RuntimeTelemetry>,
 }
