@@ -2,9 +2,7 @@ use crate::service_bus::contracts::{
     ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
     ServiceBusProtocolMessage, BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
 };
-use crate::service_bus::helpers::get_headers_from_event;
 use dashmap::DashMap;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -197,7 +195,6 @@ impl ConnectionManager {
         &self,
         req: ServiceBusForwardRequest,
     ) -> Result<ServiceBusForwardResponse, String> {
-        use crate::service_bus::contracts::protocol_types;
         use chrono::Utc;
         use uuid::Uuid;
 
@@ -211,27 +208,11 @@ impl ConnectionManager {
         let (tx, mut rx) = mpsc::unbounded_channel::<ServiceBusEventEnvelope>();
         self.subscribe_internal(reply_to_topic.clone(), tx);
 
-        let mut payload = HashMap::new();
-        payload.insert(
-            "path".to_string(),
-            serde_json::Value::String(req.path.clone()),
-        );
-        payload.insert(
-            "method".to_string(),
-            serde_json::Value::String(req.method.clone()),
-        );
+        let mut payload = req.payload.clone();
         payload.insert(
             "reply_to".to_string(),
             serde_json::Value::String(reply_to_topic.clone()),
         );
-        payload.insert(
-            "headers".to_string(),
-            serde_json::to_value(&req.headers)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-        );
-        if let Some(body) = &req.body {
-            payload.insert("body".to_string(), serde_json::Value::String(body.clone()));
-        }
 
         let correlation_id = self.next_correlation_id();
         let event = ServiceBusEventEnvelope {
@@ -240,7 +221,7 @@ impl ConnectionManager {
             service_id: BASILISK_SERVICE_ID.to_string(),
             instance_id: BASILISK_INSTANCE_ID.to_string(),
             topic: format!("service-{}", req.target_service_id),
-            message_type: protocol_types::FORWARD.to_string(),
+            message_type: req.message_type.clone(),
             correlation_id,
             causation_id: None,
             payload,
@@ -261,25 +242,10 @@ impl ConnectionManager {
         self.unsubscribe_internal(&reply_to_topic);
 
         match result {
-            Ok(Some(event)) => {
-                let status = event
-                    .payload
-                    .get("status")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(200) as u16;
-                let body = event
-                    .payload
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let headers = get_headers_from_event(&event);
-                Ok(ServiceBusForwardResponse {
-                    status,
-                    headers,
-                    body,
-                })
-            }
+            Ok(Some(event)) => Ok(ServiceBusForwardResponse {
+                message_type: event.message_type,
+                payload: event.payload,
+            }),
             Ok(None) => Err("Forward response channel closed".to_string()),
             Err(_) => Err(format!(
                 "Timeout waiting for forward response from '{}'",

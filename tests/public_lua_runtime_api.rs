@@ -715,29 +715,24 @@ async fn lua_service_bus_forward_returns_response() {
     fs::write(
         &script,
         r#"
-forward_status = nil
-forward_body = nil
-forward_header = nil
+forward_message_type = nil
+forward_payload_json = nil
 
 local ok, resp = pcall(function()
-  return basilisk.service_bus.forward("orders", "/health", "GET", nil, nil, 1000)
+  return basilisk.service_bus.forward("orders", "order.query", '{"orderId":"42"}', 1000)
 end)
 
 if ok and resp then
-  forward_status = tostring(resp.status)
-  forward_body = resp.body
-  forward_header = resp.headers["x-upstream"]
+  forward_message_type = resp.message_type
+  forward_payload_json = resp.payload_json
 end
 
 basilisk.proxy.use("/_check_forward", function(req, res, next)
-  if forward_status then
-    res:forward_headers("X-Forward-Status", forward_status)
+  if forward_message_type then
+    res:forward_headers("X-Forward-Message-Type", forward_message_type)
   end
-  if forward_body then
-    res:forward_headers("X-Forward-Body", forward_body)
-  end
-  if forward_header then
-    res:forward_headers("X-Forward-Header", forward_header)
+  if forward_payload_json then
+    res:forward_headers("X-Forward-Payload", forward_payload_json)
   end
   return next()
 end)
@@ -768,15 +763,8 @@ end)
                 if let Some(event) = msg.event {
                     if let Some(reply_to) = event.payload.get("reply_to").and_then(|v| v.as_str()) {
                         let mut payload = HashMap::new();
-                        payload.insert("status".to_string(), serde_json::json!(201));
-                        payload.insert(
-                            "body".to_string(),
-                            serde_json::Value::String("ok-from-orders".to_string()),
-                        );
-                        payload.insert(
-                            "headers".to_string(),
-                            serde_json::json!({"x-upstream": "orders"}),
-                        );
+                        payload.insert("ok".to_string(), serde_json::json!(true));
+                        payload.insert("upstream".to_string(), serde_json::json!("orders"));
 
                         let response_event = ServiceBusEventEnvelope {
                             event_id: "evt-forward-response".to_string(),
@@ -784,7 +772,7 @@ end)
                             service_id: "orders".to_string(),
                             instance_id: "orders-1".to_string(),
                             topic: reply_to.to_string(),
-                            message_type: "forward_response".to_string(),
+                            message_type: "order.reply".to_string(),
                             correlation_id: event.correlation_id,
                             causation_id: Some(event.event_id),
                             payload,
@@ -809,24 +797,18 @@ end)
     assert_eq!(
         result
             .forward_headers
-            .get("X-Forward-Status")
+            .get("X-Forward-Message-Type")
             .map(String::as_str),
-        Some("201")
+        Some("order.reply")
     );
-    assert_eq!(
-        result
-            .forward_headers
-            .get("X-Forward-Body")
-            .map(String::as_str),
-        Some("ok-from-orders")
-    );
-    assert_eq!(
-        result
-            .forward_headers
-            .get("X-Forward-Header")
-            .map(String::as_str),
-        Some("orders")
-    );
+    let payload_json = result
+        .forward_headers
+        .get("X-Forward-Payload")
+        .expect("forward payload header should be present");
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload_json).expect("forward payload should be valid JSON");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["upstream"], "orders");
 
     let _ = fs::remove_dir_all(dir);
 }

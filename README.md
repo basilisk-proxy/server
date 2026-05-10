@@ -176,7 +176,7 @@ basilisk.service_bus.port(5090)
 - `publish(topic, payloadJsonObjectString)`
 - `subscribe(topic, handlerFn)` - subscribes Lua runtime to a topic; handler receives `event`
 - `unsubscribe(topic)` - removes Lua handler and topic subscription for the runtime
-- `forward(targetServiceId, path, method, headersJsonOrNil, bodyOrNil, timeoutMsOrNil)` -> `{ status, body, headers }`
+- `forward(targetServiceId, messageType, payloadJsonObjectOrNil, timeoutMsOrNil)` -> `{ message_type, payload_json }`
 
 ### 5.3 Lua service bus callbacks and forwarding
 
@@ -204,14 +204,13 @@ end)
 
 local response = basilisk.service_bus.forward(
   "orders",                 -- target service
-  "/v1/orders/42",          -- path
-  "GET",                    -- method
-  '{"x-request-id":"abc"}',-- optional JSON headers
-  nil,                       -- optional body
+  "order.query",            -- message type
+  '{"orderId":"42"}',      -- optional JSON payload object
   30000                      -- optional timeout in ms
 )
 
-print(response.status)
+print(response.message_type)
+print(response.payload_json)
 ```
 
 `basilisk.proxy`
@@ -468,10 +467,8 @@ Forward request:
   "type": "forward",
   "forwardRequest": {
     "targetServiceId": "orders",
-    "path": "/v1/orders/42",
-    "method": "GET",
-    "headers": { "x-request-id": "abc123" },
-    "body": null,
+    "messageType": "order.query",
+    "payload": { "orderId": "42" },
     "timeoutMs": 30000
   }
 }
@@ -483,9 +480,8 @@ Forward response:
 {
   "type": "forward_response",
   "forwardResponse": {
-    "status": 200,
-    "headers": { "content-type": "application/json" },
-    "body": "{\"ok\":true}"
+    "messageType": "order.reply",
+    "payload": { "ok": true, "source": "orders" }
   },
   "message": "Forward request completed"
 }

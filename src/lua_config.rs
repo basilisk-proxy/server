@@ -742,8 +742,8 @@ fn make_service_bus_api(
         })?,
     )?;
 
-    // forward(targetServiceId, path, method, headersJson, body, timeoutMs) →
-    //   table { status, body, headers } | raises error
+    // forward(targetServiceId, messageType, payloadJsonObject, timeoutMs) →
+    //   table { message_type, payload_json } | raises error
     //
     // Sends a forward request on the bus from the reserved basilisk identity and
     // blocks (via block_in_place) until the target service replies or the timeout fires.
@@ -752,25 +752,34 @@ fn make_service_bus_api(
         "forward",
         lua.create_function(
             move |lua,
-                  (target, path, method, headers_json, body, timeout_ms): (
+                  (target, message_type, payload_json, timeout_ms): (
                 String,
                 String,
-                String,
-                Option<String>,
                 Option<String>,
                 Option<u64>,
             )| {
-                let headers: HashMap<String, String> = match headers_json {
-                    Some(ref j) => serde_json::from_str(j).map_err(mlua::Error::external)?,
+                let payload: HashMap<String, serde_json::Value> = match payload_json {
+                    Some(ref j) => {
+                        let payload_value: serde_json::Value =
+                            serde_json::from_str(j).map_err(mlua::Error::external)?;
+                        payload_value
+                            .as_object()
+                            .cloned()
+                            .ok_or_else(|| {
+                                mlua::Error::external(
+                                    "service_bus.forward payload must be a JSON object",
+                                )
+                            })?
+                            .into_iter()
+                            .collect()
+                    }
                     None => HashMap::new(),
                 };
 
                 let req = ServiceBusForwardRequest {
                     target_service_id: target,
-                    path,
-                    method,
-                    headers,
-                    body,
+                    message_type,
+                    payload,
                     timeout_ms,
                 };
 
@@ -783,13 +792,11 @@ fn make_service_bus_api(
                 match result {
                     Ok(resp) => {
                         let t = lua.create_table()?;
-                        t.set("status", resp.status)?;
-                        t.set("body", resp.body)?;
-                        let h = lua.create_table()?;
-                        for (k, v) in resp.headers {
-                            h.set(k, v)?;
-                        }
-                        t.set("headers", h)?;
+                        t.set("message_type", resp.message_type)?;
+                        t.set(
+                            "payload_json",
+                            serde_json::to_string(&resp.payload).map_err(mlua::Error::external)?,
+                        )?;
                         Ok(t)
                     }
                     Err(e) => Err(mlua::Error::external(e)),

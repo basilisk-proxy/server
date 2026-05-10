@@ -53,11 +53,10 @@ pub struct ServiceBusEventEnvelope {
 pub struct ServiceBusForwardRequest {
     #[serde(rename = "targetServiceId")]
     pub target_service_id: String,
-    pub path: String,
-    pub method: String,
+    #[serde(rename = "messageType")]
+    pub message_type: String,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
-    pub body: Option<String>,
+    pub payload: HashMap<String, serde_json::Value>,
     #[serde(rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
 }
@@ -65,10 +64,10 @@ pub struct ServiceBusForwardRequest {
 /// Response payload for service-bus-driven forwarding.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServiceBusForwardResponse {
-    pub status: u16,
+    #[serde(rename = "messageType")]
+    pub message_type: String,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
-    pub body: String,
+    pub payload: HashMap<String, serde_json::Value>,
 }
 
 /// Generic wire message used by service-bus clients.

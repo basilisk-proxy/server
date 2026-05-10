@@ -174,10 +174,8 @@ fn protocol_message_serializes_forward_request_fields() {
         r#type: protocol_types::FORWARD.to_string(),
         forward_request: Some(ServiceBusForwardRequest {
             target_service_id: "orders".to_string(),
-            path: "/v1/orders/1".to_string(),
-            method: "GET".to_string(),
-            headers: HashMap::from([("x-request-id".to_string(), "abc".to_string())]),
-            body: None,
+            message_type: "order.query".to_string(),
+            payload: HashMap::from([("orderId".to_string(), serde_json::json!("1"))]),
             timeout_ms: Some(30_000),
         }),
         ..Default::default()
@@ -268,10 +266,8 @@ async fn forward_from_basilisk_errors_when_no_subscriber() {
     let manager = ConnectionManager::new();
     let req = ServiceBusForwardRequest {
         target_service_id: "nonexistent-service".to_string(),
-        path: "/ping".to_string(),
-        method: "GET".to_string(),
-        headers: HashMap::new(),
-        body: None,
+        message_type: "ping.request".to_string(),
+        payload: HashMap::new(),
         timeout_ms: Some(500),
     };
 
