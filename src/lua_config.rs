@@ -6,6 +6,7 @@ use crate::service_bus::contracts::{
 };
 use anyhow::{anyhow, Context};
 use axum::http::HeaderMap;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use mlua::{Function, Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value};
 use std::collections::{HashMap, HashSet};
@@ -283,7 +284,6 @@ fn execute_middleware(
     headers: &HeaderMap,
     shared_context: &Table,
 ) -> LuaResult<(Option<MiddlewareResponse>, HashMap<String, String>)> {
-    let req = build_req_table(lua, path, method, headers, shared_context)?;
     let state = Arc::new(Mutex::new(MiddlewareExecutionState {
         next_called: false,
         status: 200,
@@ -292,6 +292,14 @@ fn execute_middleware(
         body: String::new(),
         ended: false,
     }));
+    let req = build_req_table(
+        lua,
+        path,
+        method,
+        headers,
+        shared_context,
+        Arc::clone(&state),
+    )?;
     let res = build_res_table(lua, Arc::clone(&state))?;
 
     let next_state = Arc::clone(&state);
@@ -312,6 +320,7 @@ fn build_req_table(
     method: &str,
     headers: &HeaderMap,
     shared_context: &Table,
+    state: Arc<Mutex<MiddlewareExecutionState>>,
 ) -> LuaResult<Table> {
     let req = lua.create_table()?;
     req.set("path", path)?;
@@ -327,6 +336,22 @@ fn build_req_table(
 
     // Use the shared context dictionary (passed from middleware lifecycle)
     req.set("ctx", shared_context.clone())?;
+
+    let auth_state = Arc::clone(&state);
+    req.set(
+        "auth",
+        lua.create_function(move |_, (_self_table, payload): (Table, Table)| {
+            let json_payload = lua_table_to_json(payload)?;
+            let payload_string =
+                serde_json::to_string(&json_payload).map_err(mlua::Error::external)?;
+            let encoded = URL_SAFE_NO_PAD.encode(payload_string.as_bytes());
+            with_middleware_state(&auth_state, |s| {
+                s.forward_headers
+                    .insert("X-Basilisk-Auth".to_string(), encoded);
+            })?;
+            Ok(())
+        })?,
+    )?;
 
     Ok(req)
 }
@@ -886,6 +911,67 @@ fn parse_path_prefix_array(table: &Table) -> LuaResult<Vec<Option<String>>> {
     }
 
     Ok(prefixes)
+}
+
+fn lua_table_to_json(table: Table) -> LuaResult<serde_json::Value> {
+    // Detect Lua array-style table with contiguous numeric keys [1..N].
+    let mut array_values = Vec::new();
+    let mut index = 1;
+    loop {
+        let value: Value = table.raw_get(index)?;
+        if let Value::Nil = value {
+            break;
+        }
+        array_values.push(lua_value_to_json(value)?);
+        index += 1;
+    }
+
+    let mut is_pure_array = true;
+    for pair in table.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        match key {
+            Value::Integer(i) if i >= 1 && (i as usize) <= array_values.len() => {}
+            _ => {
+                is_pure_array = false;
+                break;
+            }
+        }
+    }
+
+    if is_pure_array {
+        return Ok(serde_json::Value::Array(array_values));
+    }
+
+    let mut object = serde_json::Map::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let key_string = match key {
+            Value::String(s) => s.to_str()?.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => {
+                return Err(mlua::Error::external(
+                    "req.auth payload table keys must be string or number",
+                ))
+            }
+        };
+        object.insert(key_string, lua_value_to_json(value)?);
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn lua_value_to_json(value: Value) -> LuaResult<serde_json::Value> {
+    match value {
+        Value::Nil => Ok(serde_json::Value::Null),
+        Value::Boolean(b) => Ok(serde_json::Value::Bool(b)),
+        Value::Integer(i) => Ok(serde_json::json!(i)),
+        Value::Number(n) => Ok(serde_json::json!(n)),
+        Value::String(s) => Ok(serde_json::Value::String(s.to_str()?.to_string())),
+        Value::Table(t) => lua_table_to_json(t),
+        _ => Err(mlua::Error::external(
+            "req.auth payload supports only nil, boolean, number, string, and table values",
+        )),
+    }
 }
 
 fn build_event_table(lua: &Lua, event: &ServiceBusEventEnvelope) -> LuaResult<Table> {

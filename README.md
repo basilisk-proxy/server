@@ -15,7 +15,7 @@ The runtime is configured from a single Lua entry file passed on process startup
 - [3. Runtime Model](#3-runtime-model)
 - [4. Getting Started](#4-getting-started)
 - [5. Configuration (`basilisk.lua`)](#5-configuration-basilisklua)
-- [6. Lua Middleware API (Express-style)](#6-lua-middleware-api-express-style)
+- [6. Lua Middleware API](#6-lua-middleware-api)
 - [7. HTTP Registry API](#7-http-registry-api)
 - [8. Service Bus Protocol](#8-service-bus-protocol)
 - [9. Request Flow](#9-request-flow)
@@ -220,7 +220,7 @@ print(response.status)
 - `use(pathPrefix, handlerFn)` - middleware on single path prefix
 - `use({pathPrefix1, pathPrefix2, ...}, handlerFn)` - middleware on multiple path prefixes
 
-## 6. Lua Middleware API (Express-style)
+## 6. Lua Middleware API
 
 Middlewares run before proxy routing and can either pass control or short-circuit.
 
@@ -238,6 +238,7 @@ end
 - `req.method`
 - `req.headers` (header map, lowercase lookup is recommended)
 - `req.ctx` (context dictionary for storing arbitrary values shared across middleware)
+- `req:auth(payloadTable)` - marshals Lua table to JSON and stores it in protected `X-Basilisk-Auth` header (Base64URL)
 
 `res` methods:
 
@@ -290,6 +291,15 @@ end)
 ```
 
 **Reserved headers**: The header `X-Basilisk-Auth` is reserved and cannot be set by middleware. Attempting to set it will result in an error.
+
+Use `req:auth(payloadTable)` instead when you need to forward authorization context. Basilisk marshals the table as JSON, Base64URL-encodes it, and forwards it in `X-Basilisk-Auth`. The basilisk client library then decodes and unmarshals the payload for you for usage inside of your application services.
+
+```lua
+basilisk.proxy.use(function(req, res, next)
+  req:auth({ sub = "user-123", scope = "orders.read" })
+  return next()
+end)
+```
 
 ### 6.4 Route groups with array syntax
 

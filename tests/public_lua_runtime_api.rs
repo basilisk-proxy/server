@@ -1,4 +1,5 @@
 use axum::http::HeaderMap;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use basilisk::lua_config::{load_config_and_runtime, LuaRuntime};
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
@@ -213,6 +214,47 @@ fn reserved_header_x_basilisk_auth_cannot_be_set_by_middleware() {
         result.is_err(),
         "Setting X-Basilisk-Auth should cause an error"
     );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn req_auth_sets_reserved_forward_header_with_base64url_payload() {
+    let dir = test_dir("req_auth_header");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        "basilisk.proxy.use(function(req, res, next)\n\
+          req:auth({sub='user-123', roles={'admin'}, enabled=true, level=7})\n\
+          return next()\n\
+         end)\n",
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+
+    let (_config, runtime) =
+        load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
+            .expect("failed to load runtime");
+
+    let result = runtime
+        .run_middlewares("/api/test", "GET", &HeaderMap::new())
+        .expect("middleware execution should succeed");
+
+    let encoded = result
+        .forward_headers
+        .get("X-Basilisk-Auth")
+        .expect("X-Basilisk-Auth should be set by req.auth");
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .expect("forwarded auth header should be valid Base64URL");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("decoded auth payload should be valid JSON");
+    assert_eq!(parsed["sub"], "user-123");
+    assert_eq!(parsed["roles"], serde_json::json!(["admin"]));
+    assert_eq!(parsed["enabled"], true);
+    assert_eq!(parsed["level"], 7);
 
     let _ = fs::remove_dir_all(dir);
 }

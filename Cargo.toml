@@ -18,3 +18,4 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 rand = "0.10.1"
 mlua = { version = "0.11.6", features = ["lua54", "vendored", "send"] }
+base64 = "0.22"
