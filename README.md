@@ -179,6 +179,12 @@ basilisk.service_bus.port(5090)
 - `get(key)` / `set(key, value)` / `delete(key)` / `exists(key)` / `keys()`
 - list / set / hash helpers (`list_*`, `set_*`, `hash_*`) and numeric helpers (`incr`, `decr`)
 
+Runtime behavior notes:
+
+- `basilisk.cache.*` data operations (`get`, `set`, `hash_*`, `list_*`, etc.) run against the active provider backend.
+- Lua middleware can use this as a shared runtime store for sessions, tokens, counters, and feature flags.
+- Basilisk-owned internal gateway keys stay isolated in the internal namespace and are filtered from `basilisk.cache.keys()`.
+
 `basilisk.security`
 
 - `service_registration_auth(string)`
@@ -380,7 +386,46 @@ basilisk.proxy.use("/api/private", function(req, res, next)
 end)
 ```
 
-### 6.6 Example: global middleware
+### 6.6 Example: cache-backed JWT enrichment with `req:auth`
+
+This pattern uses cache as the token source and enriches downstream auth context.
+The `jwt` module below is an example module loaded from `modules/jwt.lua` via `require("jwt")`.
+
+```lua
+local jwt = require("jwt")
+
+basilisk.proxy.use("/api", function(req, res, next)
+    local device_id = req.headers["x-device-key"];
+    if not device_id then
+        return next()
+    end
+
+    local cache_key = "session:jwt:" .. device_id
+    local token = basilisk.cache.get(cache_key)
+    if not token then
+        return next()
+    end
+
+    local claims, err = jwt.decode_and_verify(token)
+
+    if err or not claims then
+        -- Evict stale/bad token and continue without auth enrichment.
+        basilisk.cache.delete(cache_key)
+    else
+        req:auth({
+            sub = claims.sub,
+            roles = claims.roles,
+            tenant = claims.tenant,
+            session_id = device_id,
+            token_source = "cache"
+        })
+    end
+
+    return next()
+end)
+```
+
+### 6.7 Example: global middleware
 
 ```lua
 basilisk.proxy.use(function(req, res, next)
