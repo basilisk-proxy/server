@@ -31,6 +31,12 @@ pub fn basilisk_connection_key() -> String {
     format!("{}:{}", BASILISK_SERVICE_ID, BASILISK_INSTANCE_ID)
 }
 
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionManager {
     /// Creates an empty manager and seeds the reserved basilisk identity as already
     /// connected and authenticated.
@@ -108,7 +114,8 @@ impl ConnectionManager {
             .filter(|r| {
                 r.key() != exclude_key
                     && r.value().authenticated
-                    && r.value().subscriptions.contains(&topic.to_string())
+                    && (r.value().subscriptions.contains(&topic.to_string())
+                        || r.value().subscriptions.contains(&String::from("*")))
             })
             .map(|r| (r.key().clone(), r.value().tx.clone()))
             .collect()

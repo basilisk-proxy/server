@@ -15,110 +15,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
+const ROUTE_CACHE_NAMESPACE: &str = "route-resolution";
+const ROUTE_CACHE_MISS_SENTINEL: &str = "__basilisk:miss__";
+
 pub struct ProxyHandler {
     counters: DashMap<String, AtomicUsize>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::GatewayConfig;
-    use crate::gateway::AppState;
-    use crate::lua_config::LuaRuntime;
-    use crate::observability::RuntimeTelemetry;
-    use crate::registry::ServiceRegistry;
-    use crate::service_bus::connection_manager::ConnectionManager;
-    use axum::body::Body;
-    use axum::extract::State;
-    use axum::http::{Request, StatusCode};
-    use axum::response::IntoResponse;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_handle_proxy_not_found() {
-        let registry = Arc::new(ServiceRegistry::new());
-        let config = GatewayConfig::default();
-        let connection_manager = Arc::new(ConnectionManager::new());
-        let proxy_handler = ProxyHandler::new();
-
-        let state = Arc::new(AppState {
-            config,
-            registry,
-            connection_manager,
-            proxy_handler,
-            lua_runtime: LuaRuntime::allow_all(),
-            telemetry: Arc::new(RuntimeTelemetry::new()),
-        });
-
-        let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
-
-        let req = Request::builder()
-            .uri("/unknown")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = ProxyHandler::handle_proxy(State(state), ConnectInfo(connect_info), req)
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_handle_proxy_no_healthy_instances() {
-        let registry = Arc::new(ServiceRegistry::new());
-        let config = GatewayConfig::default();
-        let connection_manager = Arc::new(ConnectionManager::new());
-        let proxy_handler = ProxyHandler::new();
-
-        let service_id = "test-service".to_string();
-        registry
-            .register(crate::models::RegistrationRequest {
-                service_id: service_id.clone(),
-                fingerprint: "abc".to_string(),
-                path_prefixes: vec!["/api".to_string()],
-                instance: crate::models::InstanceInfo {
-                    instance_id: "inst-1".to_string(),
-                    scheme: "http".to_string(),
-                    host: "localhost".to_string(),
-                    port: 8080,
-                    weight: 1,
-                },
-                auth: crate::models::AuthInfo {
-                    r#type: "none".to_string(),
-                    token: "token".to_string(),
-                },
-            })
-            .await;
-
-        registry
-            .update_instance_status(&service_id, "inst-1", InstanceStatus::Down)
-            .await;
-
-        let state = Arc::new(AppState {
-            config,
-            registry,
-            connection_manager,
-            proxy_handler,
-            lua_runtime: LuaRuntime::allow_all(),
-            telemetry: Arc::new(RuntimeTelemetry::new()),
-        });
-
-        let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
-
-        let req = Request::builder()
-            .uri("/api/test")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = ProxyHandler::handle_proxy(State(state), ConnectInfo(connect_info), req)
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(body, "No healthy instances available");
+impl Default for ProxyHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -201,7 +108,7 @@ impl ProxyHandler {
         let target_instance =
             match state
                 .proxy_handler
-                .pick_instance(&state, &address, &service_id, &service)
+                .pick_instance(&state, address.as_str(), &service_id, &service)
             {
                 Ok(inst) => inst,
                 Err((status, msg)) => {
@@ -241,10 +148,7 @@ impl ProxyHandler {
         state: &AppState,
         path: &str,
     ) -> Result<(String, ServiceDefinition), StatusCode> {
-        let service_id = state
-            .registry
-            .resolve_service_by_path(path)
-            .ok_or(StatusCode::NOT_FOUND)?;
+        let service_id = Self::resolve_service_id(state, path).ok_or(StatusCode::NOT_FOUND)?;
 
         let service = state
             .registry
@@ -254,10 +158,55 @@ impl ProxyHandler {
         Ok((service_id, service))
     }
 
+    fn resolve_service_id(state: &AppState, path: &str) -> Option<String> {
+        if !state.config.cache.enabled {
+            return state.registry.resolve_service_by_path(path);
+        }
+
+        let ttl_seconds = state.config.cache.service_resolution_ttl_seconds;
+        if ttl_seconds == 0 {
+            return state.registry.resolve_service_by_path(path);
+        }
+
+        let route_cache_key = format!(
+            "{ROUTE_CACHE_NAMESPACE}:v{}",
+            state
+                .cache
+                .internal_get(REGISTRY_VERSION_CACHE_KEY)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "0".to_string())
+        );
+
+        if let Ok(Some(cached)) = state.cache.internal_hash_get(&route_cache_key, path) {
+            return if cached == ROUTE_CACHE_MISS_SENTINEL {
+                None
+            } else {
+                Some(cached)
+            };
+        }
+
+        let resolved = state.registry.resolve_service_by_path(path);
+        let cached_value = resolved
+            .clone()
+            .unwrap_or_else(|| ROUTE_CACHE_MISS_SENTINEL.to_string());
+
+        if let Err(err) = state.cache.internal_hash_set_with_ttl(
+            &route_cache_key,
+            path,
+            cached_value,
+            ttl_seconds,
+        ) {
+            tracing::warn!("failed to cache route resolution for {path}: {err}");
+        }
+
+        resolved
+    }
+
     fn pick_instance<'a>(
         &self,
         state: &AppState,
-        address: &String,
+        address: &str,
         service_id: &str,
         service: &'a ServiceDefinition,
     ) -> Result<&'a ServiceInstance, (StatusCode, &'static str)> {
@@ -277,11 +226,11 @@ impl ProxyHandler {
         let strategy = &state.config.routing.default_load_balancing_strategy;
         let target_instance = match strategy.as_str() {
             "WEIGHTED_ROUND_ROBIN" => {
-                self.pick_weighted_round_robin(service_id, &healthy_instances)
+                self.pick_weighted_round_robin(state, service_id, &healthy_instances)
             }
             "WEIGHTED_RANDOM" => self.pick_weighted_random(&healthy_instances),
-            "IP_HASH" => self.pick_ip_hash(address.as_str(), &healthy_instances),
-            _ => self.pick_round_robin(service_id, &healthy_instances),
+            "IP_HASH" => self.pick_ip_hash(address, &healthy_instances),
+            _ => self.pick_round_robin(state, service_id, &healthy_instances),
         };
         Ok(target_instance)
     }
@@ -364,9 +313,20 @@ impl ProxyHandler {
 
     fn pick_round_robin<'a>(
         &self,
+        state: &AppState,
         service_id: &str,
         instances: &[&'a ServiceInstance],
     ) -> &'a ServiceInstance {
+        if let Ok(counter) = state
+            .cache
+            .internal_incr(&format!("balancer:rr:{service_id}"), 1)
+        {
+            if counter > 0 {
+                let index = (counter.saturating_sub(1) as usize) % instances.len();
+                return instances[index];
+            }
+        }
+
         let counter = self
             .counters
             .entry(service_id.to_string())
@@ -377,6 +337,7 @@ impl ProxyHandler {
 
     fn pick_weighted_round_robin<'a>(
         &self,
+        state: &AppState,
         service_id: &str,
         instances: &[&'a ServiceInstance],
     ) -> &'a ServiceInstance {
@@ -385,11 +346,19 @@ impl ProxyHandler {
             return instances[0];
         }
 
-        let counter = self
-            .counters
-            .entry(service_id.to_string())
-            .or_insert_with(|| AtomicUsize::new(0));
-        let current_val = counter.fetch_add(1, Ordering::SeqCst) % total_weight as usize;
+        let cache_counter = state
+            .cache
+            .internal_incr(&format!("balancer:wrr:{service_id}"), 1)
+            .ok();
+        let current_val = if let Some(counter) = cache_counter.filter(|counter| *counter > 0) {
+            counter.saturating_sub(1) as usize % total_weight as usize
+        } else {
+            let counter = self
+                .counters
+                .entry(service_id.to_string())
+                .or_insert_with(|| AtomicUsize::new(0));
+            counter.fetch_add(1, Ordering::SeqCst) % total_weight as usize
+        };
 
         let mut running_weight = 0;
         for instance in instances {
@@ -423,5 +392,102 @@ impl ProxyHandler {
         ip.hash(&mut hasher);
         let index = (hasher.finish() as usize) % instances.len();
         instances[index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GatewayConfig;
+    use crate::gateway::AppState;
+    use crate::lua_config::LuaRuntime;
+    use crate::observability::RuntimeTelemetry;
+    use crate::registry::ServiceRegistry;
+    use crate::service_bus::connection_manager::ConnectionManager;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
+    use std::sync::Arc;
+
+    fn test_state() -> Arc<AppState> {
+        let registry = Arc::new(ServiceRegistry::new());
+        let config = GatewayConfig::default();
+        let connection_manager = Arc::new(ConnectionManager::new());
+        let proxy_handler = ProxyHandler::new();
+        Arc::new(AppState {
+            config,
+            registry,
+            connection_manager,
+            proxy_handler,
+            lua_runtime: LuaRuntime::allow_all(),
+            cache: Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init")),
+            telemetry: Arc::new(RuntimeTelemetry::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_handle_proxy_not_found() {
+        let state = test_state();
+
+        let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
+
+        let req = Request::builder()
+            .uri("/unknown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ProxyHandler::handle_proxy(State(state), ConnectInfo(connect_info), req)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_handle_proxy_no_healthy_instances() {
+        let registry = Arc::new(ServiceRegistry::new());
+
+        let service_id = "test-service".to_string();
+        registry
+            .register(crate::models::RegistrationRequest {
+                service_id: service_id.clone(),
+                fingerprint: "abc".to_string(),
+                path_prefixes: vec!["/api".to_string()],
+                instance: crate::models::InstanceInfo {
+                    instance_id: "inst-1".to_string(),
+                    scheme: "http".to_string(),
+                    host: "localhost".to_string(),
+                    port: 8080,
+                    weight: 1,
+                },
+                auth: crate::models::AuthInfo {
+                    r#type: "none".to_string(),
+                    token: "token".to_string(),
+                },
+            })
+            .await;
+
+        registry
+            .update_instance_status(&service_id, "inst-1", InstanceStatus::Down)
+            .await;
+
+        let state = test_state();
+
+        let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
+
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ProxyHandler::handle_proxy(State(state), ConnectInfo(connect_info), req)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, "No healthy instances available");
     }
 }

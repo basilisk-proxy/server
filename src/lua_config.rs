@@ -1,3 +1,4 @@
+use crate::cache::GatewayCache;
 use crate::config::GatewayConfig;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
@@ -62,7 +63,7 @@ pub fn load_config_and_runtime(
     entry_file: &str,
     registry: Arc<ServiceRegistry>,
     connection_manager: Arc<ConnectionManager>,
-) -> anyhow::Result<(GatewayConfig, Arc<LuaRuntime>)> {
+) -> anyhow::Result<(GatewayConfig, Arc<LuaRuntime>, Arc<GatewayCache>)> {
     let root = resolve_script_root(Path::new(entry_file))?;
     let canonical_entry = canonicalize_script(entry_file, &root)?;
 
@@ -84,12 +85,14 @@ pub fn load_config_and_runtime(
 
     let middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
     let config_state = Arc::new(Mutex::new(GatewayConfig::default()));
+    let cache = Arc::new(GatewayCache::new("memory")?);
     let event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     register_primitives(
         &lua,
         Arc::clone(&config_state),
+        Arc::clone(&cache),
         Arc::clone(&registry),
         Arc::clone(&connection_manager),
         Arc::clone(&middleware_mounts),
@@ -117,6 +120,11 @@ pub fn load_config_and_runtime(
         .lock()
         .map_err(|_| anyhow!("Lua config lock poisoned"))?
         .clone();
+
+    let internal_namespace = format!("basilisk:gateway:{}", config.cache.key_prefix);
+    cache
+        .set_internal_namespace(&internal_namespace)
+        .with_context(|| format!("Failed to set cache namespace to '{internal_namespace}'"))?;
 
     let (event_dispatch_tx, event_dispatch_rx) =
         mpsc::unbounded_channel::<ServiceBusEventEnvelope>();
@@ -159,7 +167,7 @@ pub fn load_config_and_runtime(
         });
     }
 
-    Ok((config, runtime))
+    Ok((config, runtime, cache))
 }
 
 impl LuaRuntime {
@@ -466,8 +474,6 @@ fn to_middleware_response_with_forward_headers(
             body: state.body.clone(),
             headers: state.headers.clone(),
         })
-    } else if state.next_called {
-        None
     } else {
         None
     };
@@ -478,6 +484,7 @@ fn to_middleware_response_with_forward_headers(
 fn register_primitives(
     lua: &Lua,
     config: Arc<Mutex<GatewayConfig>>,
+    cache: Arc<GatewayCache>,
     registry: Arc<ServiceRegistry>,
     connection_manager: Arc<ConnectionManager>,
     middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
@@ -487,6 +494,7 @@ fn register_primitives(
 
     basilisk.set("server", make_server_api(lua, Arc::clone(&config))?)?;
     basilisk.set("gateway", make_gateway_api(lua, Arc::clone(&config))?)?;
+    basilisk.set("cache", make_cache_api(lua, Arc::clone(&config), cache)?)?;
     basilisk.set("security", make_security_api(lua, Arc::clone(&config))?)?;
     basilisk.set(
         "observability",
@@ -565,6 +573,428 @@ fn make_gateway_api(lua: &Lua, config: Arc<Mutex<GatewayConfig>>) -> LuaResult<T
         "strip_prefix",
         lua.create_function(move |_, strip_prefix: bool| {
             with_config_mut(&cfg, |c| c.routing.strip_prefix = strip_prefix)
+        })?,
+    )?;
+
+    Ok(table)
+}
+
+fn make_cache_api(
+    lua: &Lua,
+    config: Arc<Mutex<GatewayConfig>>,
+    cache: Arc<GatewayCache>,
+) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "enabled",
+        lua.create_function(move |_, enabled: bool| {
+            with_config_mut(&cfg, |c| c.cache.enabled = enabled)
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "provider",
+        lua.create_function(move |_, provider: String| {
+            cache_handle
+                .reconfigure_provider(&provider)
+                .map_err(cache_to_lua_error)?;
+            with_config_mut(&cfg, |c| c.cache.provider = provider)
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "key_prefix",
+        lua.create_function(move |_, key_prefix: String| {
+            with_config_mut(&cfg, |c| c.cache.key_prefix = key_prefix)
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "service_resolution_ttl_seconds",
+        lua.create_function(move |_, ttl_seconds: u64| {
+            with_config_mut(&cfg, |c| {
+                c.cache.service_resolution_ttl_seconds = ttl_seconds;
+                // Keep ttl_seconds aligned for compatibility with older scripts.
+                c.cache.ttl_seconds = ttl_seconds;
+            })
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "ttl_seconds",
+        lua.create_function(move |_, ttl_seconds: u64| {
+            with_config_mut(&cfg, |c| {
+                c.cache.ttl_seconds = ttl_seconds;
+                c.cache.service_resolution_ttl_seconds = ttl_seconds;
+            })
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "strategy",
+        lua.create_function(move |_, strategy: String| {
+            with_config_mut(&cfg, |c| c.cache.strategy = strategy)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "get",
+        lua.create_function(move |_, key: String| {
+            cache_handle.get(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "get_or_set",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .get_or_set(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle.set(&key, value).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_with_ttl",
+        lua.create_function(move |_, (key, value, ttl): (String, String, u64)| {
+            cache_handle
+                .set_with_ttl(&key, value, ttl)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_if_not_exists",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .set_if_not_exists(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "incr",
+        lua.create_function(move |_, (key, delta): (String, i64)| {
+            cache_handle.incr(&key, delta).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "decr",
+        lua.create_function(move |_, (key, delta): (String, i64)| {
+            cache_handle.decr(&key, delta).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_append",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .list_append(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_prepend",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .list_prepend(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_pop_left",
+        lua.create_function(move |_, key: String| {
+            cache_handle.list_pop_left(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_pop_right",
+        lua.create_function(move |_, key: String| {
+            cache_handle
+                .list_pop_right(&key)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_length",
+        lua.create_function(move |_, key: String| {
+            cache_handle.list_length(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_index",
+        lua.create_function(move |_, (key, index): (String, usize)| {
+            cache_handle
+                .list_index(&key, index)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "list_range",
+        lua.create_function(move |lua, (key, start, end): (String, usize, usize)| {
+            string_vec_to_lua_table(
+                lua,
+                cache_handle
+                    .list_range(&key, start, end)
+                    .map_err(cache_to_lua_error)?,
+            )
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_add",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .set_add(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_remove",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .set_remove(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_is_member",
+        lua.create_function(move |_, (key, value): (String, String)| {
+            cache_handle
+                .set_is_member(&key, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_members",
+        lua.create_function(move |lua, key: String| {
+            string_vec_to_lua_table(
+                lua,
+                cache_handle.set_members(&key).map_err(cache_to_lua_error)?,
+            )
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_random_member",
+        lua.create_function(move |_, key: String| {
+            cache_handle
+                .set_random_member(&key)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_sort",
+        lua.create_function(move |lua, key: String| {
+            string_vec_to_lua_table(
+                lua,
+                cache_handle.set_sort(&key).map_err(cache_to_lua_error)?,
+            )
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_sort_with_options",
+        lua.create_function(move |lua, (key, options): (String, String)| {
+            string_vec_to_lua_table(
+                lua,
+                cache_handle
+                    .set_sort_with_options(&key, options)
+                    .map_err(cache_to_lua_error)?,
+            )
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_sort_by_score",
+        lua.create_function(
+            move |lua, (key, min, max): (String, Option<f64>, Option<f64>)| {
+                string_vec_to_lua_table(
+                    lua,
+                    cache_handle
+                        .set_sort_by_score(&key, min, max)
+                        .map_err(cache_to_lua_error)?,
+                )
+            },
+        )?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_sort_by_score_with_options",
+        lua.create_function(
+            move |lua, (key, min, max, options): (String, Option<f64>, Option<f64>, String)| {
+                string_vec_to_lua_table(
+                    lua,
+                    cache_handle
+                        .set_sort_by_score_with_options(&key, min, max, options)
+                        .map_err(cache_to_lua_error)?,
+                )
+            },
+        )?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "set_card",
+        lua.create_function(move |_, key: String| {
+            cache_handle.set_card(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_get",
+        lua.create_function(move |_, (key, field): (String, String)| {
+            cache_handle
+                .hash_get(&key, &field)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_set",
+        lua.create_function(move |_, (key, field, value): (String, String, String)| {
+            cache_handle
+                .hash_set(&key, &field, value)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_delete",
+        lua.create_function(move |_, (key, field): (String, String)| {
+            cache_handle
+                .hash_delete(&key, &field)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_exists",
+        lua.create_function(move |_, (key, field): (String, String)| {
+            cache_handle
+                .hash_exists(&key, &field)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_fields",
+        lua.create_function(move |lua, key: String| {
+            string_vec_to_lua_table(
+                lua,
+                cache_handle.hash_fields(&key).map_err(cache_to_lua_error)?,
+            )
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_random_field",
+        lua.create_function(move |_, key: String| {
+            cache_handle
+                .hash_random_field(&key)
+                .map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "hash_length",
+        lua.create_function(move |_, key: String| {
+            cache_handle.hash_length(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "keys",
+        lua.create_function(move |lua, ()| {
+            string_vec_to_lua_table(lua, cache_handle.keys().map_err(cache_to_lua_error)?)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "exists",
+        lua.create_function(move |_, key: String| {
+            cache_handle.exists(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "unlink",
+        lua.create_function(move |_, key: String| {
+            cache_handle.unlink(&key).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "expire",
+        lua.create_function(move |_, (key, ttl): (String, u64)| {
+            cache_handle.expire(&key, ttl).map_err(cache_to_lua_error)
+        })?,
+    )?;
+
+    let cache_handle = Arc::clone(&cache);
+    table.set(
+        "delete",
+        lua.create_function(move |_, key: String| {
+            cache_handle.delete(&key).map_err(cache_to_lua_error)
         })?,
     )?;
 
@@ -920,6 +1350,14 @@ fn parse_path_prefix_array(table: &Table) -> LuaResult<Vec<Option<String>>> {
     Ok(prefixes)
 }
 
+fn string_vec_to_lua_table(lua: &Lua, values: Vec<String>) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    for (index, value) in values.into_iter().enumerate() {
+        table.raw_set(index + 1, value)?;
+    }
+    Ok(table)
+}
+
 fn lua_table_to_json(table: Table) -> LuaResult<serde_json::Value> {
     // Detect Lua array-style table with contiguous numeric keys [1..N].
     let mut array_values = Vec::new();
@@ -1088,6 +1526,10 @@ fn lua_to_anyhow(err: mlua::Error) -> anyhow::Error {
     anyhow!("Lua runtime error: {err}")
 }
 
+fn cache_to_lua_error(err: anyhow::Error) -> mlua::Error {
+    mlua::Error::external(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::load_config_and_runtime;
@@ -1118,7 +1560,7 @@ mod tests {
         let registry = Arc::new(ServiceRegistry::new());
         let connection_manager = Arc::new(ConnectionManager::new());
 
-        let (config, _runtime) =
+        let (config, _runtime, _cache) =
             load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
                 .expect("failed to load runtime");
 
@@ -1141,7 +1583,7 @@ mod tests {
         let registry = Arc::new(ServiceRegistry::new());
         let connection_manager = Arc::new(ConnectionManager::new());
 
-        let (_config, runtime) =
+        let (_config, runtime, _cache) =
             load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
                 .expect("failed to load runtime");
 

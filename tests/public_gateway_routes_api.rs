@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use basilisk::cache::GatewayCache;
 use basilisk::config::GatewayConfig;
 use basilisk::gateway::{proxy::ProxyHandler, routes, AppState};
 use basilisk::lua_config::LuaRuntime;
@@ -18,6 +19,7 @@ fn test_state() -> Arc<AppState> {
         connection_manager: Arc::new(ConnectionManager::new()),
         proxy_handler: ProxyHandler::new(),
         lua_runtime: LuaRuntime::allow_all(),
+        cache: Arc::new(GatewayCache::new("memory").expect("cache init")),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     })
 }

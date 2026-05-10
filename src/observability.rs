@@ -36,6 +36,12 @@ pub struct RuntimeTelemetrySnapshot {
     pub service_distributions: Vec<DistributionSummary>,
 }
 
+impl Default for RuntimeTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeTelemetry {
     pub fn new() -> Self {
         Self {

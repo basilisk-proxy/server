@@ -35,7 +35,7 @@ fn load_config_and_runtime_exposes_lua_only_configuration() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (config, _runtime) =
+    let (config, _runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -67,7 +67,7 @@ fn middleware_pipeline_supports_next_and_short_circuit() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -87,6 +87,107 @@ fn middleware_pipeline_supports_next_and_short_circuit() {
     assert_eq!(
         denied.headers.get("x-policy").map(String::as_str),
         Some("lua")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cache_primitive_configures_provider_and_exposes_runtime_operations() {
+    let dir = test_dir("cache_runtime");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        "basilisk.cache.enabled(true)\n\
+         basilisk.cache.provider('memory')\n\
+         basilisk.cache.key_prefix('proxy-test')\n\
+         basilisk.cache.service_resolution_ttl_seconds(42)\n\
+         basilisk.cache.ttl_seconds(42)\n\
+         basilisk.cache.strategy('lru')\n\
+         local seeded = basilisk.cache.get_or_set('greeting', 'hello')\n\
+         local reused = basilisk.cache.get_or_set('greeting', 'ignored')\n\
+         basilisk.cache.list_append('jobs', 'a')\n\
+         basilisk.cache.list_append('jobs', 'b')\n\
+         basilisk.cache.hash_set('session:1', 'user', 'basil')\n\
+         basilisk.cache.set_add('tags', '3')\n\
+         basilisk.cache.set_add('tags', '1')\n\
+         basilisk.proxy.use('/_cache', function(req, res, next)\n\
+         res:forward_headers('X-Seeded', seeded)\n\
+         res:forward_headers('X-Reused', reused)\n\
+         res:forward_headers('X-Job-Length', tostring(basilisk.cache.list_length('jobs')))\n\
+         res:forward_headers('X-First-Job', basilisk.cache.list_index('jobs', 0))\n\
+         res:forward_headers('X-Session-User', basilisk.cache.hash_get('session:1', 'user'))\n\
+         res:forward_headers('X-Tag-Count', tostring(basilisk.cache.set_card('tags')))\n\
+         res:forward_headers('X-Next-Hit', tostring(basilisk.cache.incr('hits', 1)))\n\
+         return next()\n\
+         end)\n",
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+
+    let (config, runtime, cache) =
+        load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
+            .expect("failed to load runtime");
+
+    assert!(config.cache.enabled);
+    assert_eq!(config.cache.provider, "memory");
+    assert_eq!(config.cache.key_prefix, "proxy-test");
+    assert_eq!(config.cache.service_resolution_ttl_seconds, 42);
+    assert_eq!(config.cache.ttl_seconds, 42);
+    assert_eq!(config.cache.strategy, "lru");
+
+    let result = runtime
+        .run_middlewares("/_cache", "GET", &HeaderMap::new())
+        .expect("middleware execution should succeed");
+
+    assert_eq!(
+        result.forward_headers.get("X-Seeded").map(String::as_str),
+        Some("hello")
+    );
+    assert_eq!(
+        result.forward_headers.get("X-Reused").map(String::as_str),
+        Some("hello")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Job-Length")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-First-Job")
+            .map(String::as_str),
+        Some("a")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Session-User")
+            .map(String::as_str),
+        Some("basil")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Tag-Count")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        result.forward_headers.get("X-Next-Hit").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        cache
+            .get("greeting")
+            .expect("cache read should succeed")
+            .as_deref(),
+        Some("hello")
     );
 
     let _ = fs::remove_dir_all(dir);
@@ -123,7 +224,7 @@ fn context_is_preserved_and_extended_across_middleware() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -160,7 +261,7 @@ fn forward_headers_are_accumulated_across_middleware() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -203,7 +304,7 @@ fn reserved_header_x_basilisk_auth_cannot_be_set_by_middleware() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -234,7 +335,7 @@ fn req_auth_sets_reserved_forward_header_with_base64url_payload() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -275,7 +376,7 @@ fn middleware_can_be_mounted_on_multiple_routes_using_array() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -298,7 +399,7 @@ fn middleware_can_be_mounted_on_multiple_routes_using_array() {
         .run_middlewares("/api/inventory", "GET", &HeaderMap::new())
         .expect("middleware execution should succeed");
     assert!(result.short_circuit_response.is_none());
-    assert!(result.forward_headers.get("X-Checked").is_none());
+    assert!(!result.forward_headers.contains_key("X-Checked"));
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -318,7 +419,7 @@ fn multi_path_middleware_can_short_circuit() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -359,7 +460,7 @@ fn multi_path_middleware_stores_context_properly() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -406,7 +507,7 @@ fn multi_path_and_single_path_middleware_can_coexist() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -422,7 +523,7 @@ fn multi_path_and_single_path_middleware_can_coexist() {
         result.forward_headers.get("X-Global").map(String::as_str),
         Some("true")
     );
-    assert!(result.forward_headers.get("X-Admin").is_none());
+    assert!(!result.forward_headers.contains_key("X-Admin"));
 
     // /admin should have admin and global headers
     let result = runtime
@@ -436,7 +537,7 @@ fn multi_path_and_single_path_middleware_can_coexist() {
         result.forward_headers.get("X-Global").map(String::as_str),
         Some("true")
     );
-    assert!(result.forward_headers.get("X-Version").is_none());
+    assert!(!result.forward_headers.contains_key("X-Version"));
 
     // /other should only have global header
     let result = runtime
@@ -446,8 +547,8 @@ fn multi_path_and_single_path_middleware_can_coexist() {
         result.forward_headers.get("X-Global").map(String::as_str),
         Some("true")
     );
-    assert!(result.forward_headers.get("X-Version").is_none());
-    assert!(result.forward_headers.get("X-Admin").is_none());
+    assert!(!result.forward_headers.contains_key("X-Version"));
+    assert!(!result.forward_headers.contains_key("X-Admin"));
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -484,7 +585,7 @@ fn lua_can_require_modules_from_modules_directory() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -558,7 +659,7 @@ fn lua_modules_can_be_shared_across_middleware() {
     let registry = Arc::new(ServiceRegistry::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -611,7 +712,7 @@ end)
     let connection_manager = Arc::new(ConnectionManager::new());
     let cm = Arc::clone(&connection_manager);
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -674,7 +775,7 @@ end)
     let connection_manager = Arc::new(ConnectionManager::new());
     let cm = Arc::clone(&connection_manager);
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
@@ -785,7 +886,7 @@ end)
         }
     });
 
-    let (_config, runtime) =
+    let (_config, runtime, _cache) =
         load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
             .expect("failed to load runtime");
 
