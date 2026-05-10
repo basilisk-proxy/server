@@ -1,3 +1,8 @@
+-- Core cache settings
+basilisk.cache.provider("memory") -- Options: "memory", "redis", "memcached"
+basilisk.cache.ttl_seconds(300) -- Default TTL for cached responses
+basilisk.cache.strategy("lru") -- Eviction strategy for the cache provider
+
 -- Core server settings
 basilisk.server.host("0.0.0.0")
 basilisk.server.port(8080)

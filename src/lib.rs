@@ -1,3 +1,5 @@
+/// Cache strategy abstractions and backend implementations.
+pub mod cache;
 pub mod config;
 pub mod gateway;
 pub mod lua_config;

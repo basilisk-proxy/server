@@ -6,6 +6,8 @@ Basilisk is a programmable reverse proxy with three built-in control planes:
 - TCP service bus (publish/subscribe and forward requests)
 - Lua runtime for configuration and request middleware
 
+It also exposes a library-level cache strategy module with in-memory, Redis, and Memcached providers.
+
 The runtime is configured from a single Lua entry file passed on process startup.
 
 ## Table of Contents
@@ -43,6 +45,7 @@ Core modules:
 
 - `src/main.rs`: process bootstrap, CLI argument handling, HTTP route wiring, task spawning
 - `src/config.rs`: runtime config model (`GatewayConfig`) and defaults
+- `src/cache/`: provider-agnostic cache trait plus private backend strategies
 - `src/lua_config.rs`: Lua VM bootstrap, primitive registration, middleware execution
 - `src/gateway/`:
   - `mod.rs`: `AppState`
@@ -109,6 +112,24 @@ For development validation:
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test -- --nocapture
+```
+
+### Optional cache backends for library consumers
+
+The cache module is currently exposed as a Rust library API, not as a Lua/runtime primitive.
+
+- `memory` works entirely in-process with no external dependency.
+- `redis` uses `BASILISK_REDIS_URL` and defaults to `redis://127.0.0.1:6379/`.
+- `memcached` uses `BASILISK_MEMCACHED_URL` and defaults to `memcache://127.0.0.1:11211`.
+
+Example:
+
+```rust
+use basilisk::cache::CacheManager;
+
+let mut cache = <dyn CacheManager>::new("memory");
+cache.set("greeting", "hello".to_string());
+assert_eq!(cache.get("greeting").as_deref(), Some("hello"));
 ```
 
 ## 5. Configuration (`basilisk.lua`)
@@ -525,6 +546,12 @@ Background task:
 - Use `type = "forward"` messages to request remote handling through the bus.
 - Receive structured `forward_response` payloads.
 
+### 10.4 Shared cache strategy for library consumers
+
+- Use `basilisk::cache::CacheManager` when you need a backend-swappable cache abstraction.
+- Select `memory`, `redis`, or `memcached` at construction time.
+- Redis and Memcached backends are private concrete strategies behind the module boundary.
+
 ## 11. Testing
 Top-level integration tests are in `tests/`:
 
@@ -542,6 +569,8 @@ cargo test -- --nocapture
 
 ## 12. Operational Notes
 - Registry and service buses are in-memory; state is not persisted across restarts.
+- The cache module is a library surface; it is not yet wired into the proxy/runtime configuration flow.
+- Redis and Memcached providers degrade to unavailable/no-op behavior when their backend cannot be reached.
 - Lua middleware runs in-process; panics or heavy logic can impact request latency.
 - `service_bus.max_message_chars` limits inbound line length per client message.
 - Runtime telemetry is available at `GET /registry/metrics/runtime`.
