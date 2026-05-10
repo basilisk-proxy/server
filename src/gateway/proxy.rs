@@ -13,6 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct ProxyHandler {
     counters: DashMap<String, AtomicUsize>,
@@ -24,6 +25,7 @@ mod tests {
     use crate::config::GatewayConfig;
     use crate::gateway::AppState;
     use crate::lua_config::LuaRuntime;
+    use crate::observability::RuntimeTelemetry;
     use crate::registry::ServiceRegistry;
     use crate::service_bus::connection_manager::ConnectionManager;
     use axum::body::Body;
@@ -45,6 +47,7 @@ mod tests {
             connection_manager,
             proxy_handler,
             lua_runtime: LuaRuntime::allow_all(),
+            telemetry: Arc::new(RuntimeTelemetry::new()),
         });
 
         let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
@@ -72,7 +75,6 @@ mod tests {
             .register(crate::models::RegistrationRequest {
                 service_id: service_id.clone(),
                 fingerprint: "abc".to_string(),
-                health_check: "/health".to_string(),
                 path_prefixes: vec!["/api".to_string()],
                 instance: crate::models::InstanceInfo {
                     instance_id: "inst-1".to_string(),
@@ -98,6 +100,7 @@ mod tests {
             connection_manager,
             proxy_handler,
             lua_runtime: LuaRuntime::allow_all(),
+            telemetry: Arc::new(RuntimeTelemetry::new()),
         });
 
         let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
@@ -133,6 +136,7 @@ impl ProxyHandler {
         ConnectInfo(connect_info): ConnectInfo<SocketAddr>,
         req: Request,
     ) -> impl IntoResponse {
+        let total_started = Instant::now();
         let path = req.uri().path().to_string();
         let ip_address = connect_info.ip().to_canonical();
         let address = match ip_address {
@@ -140,6 +144,7 @@ impl ProxyHandler {
             IpAddr::V6(raw) => format!("[{}]:{}", raw, connect_info.port()),
         };
 
+        let middleware_started = Instant::now();
         let middleware_result =
             match state
                 .lua_runtime
@@ -147,12 +152,24 @@ impl ProxyHandler {
             {
                 Ok(result) => result,
                 Err(err) => {
+                    state
+                        .telemetry
+                        .record_proxy_latency("proxy.middleware", middleware_started.elapsed());
+                    state
+                        .telemetry
+                        .record_proxy_latency("proxy.total", total_started.elapsed());
                     tracing::error!("Lua middleware execution failed: {}", err);
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
+        state
+            .telemetry
+            .record_proxy_latency("proxy.middleware", middleware_started.elapsed());
 
         if let Some(reject) = middleware_result.short_circuit_response {
+            state
+                .telemetry
+                .record_proxy_latency("proxy.total", total_started.elapsed());
             let mut builder = axum::response::Response::builder()
                 .status(StatusCode::from_u16(reject.status).unwrap_or(StatusCode::UNAUTHORIZED));
             for (k, v) in reject.headers {
@@ -163,25 +180,61 @@ impl ProxyHandler {
                 .unwrap_or_else(|_| axum::response::Response::new(Body::from("Unauthorized")));
         }
 
+        let resolve_started = Instant::now();
         let (service_id, service) = match Self::resolve_service(&state, &path) {
             Ok(res) => res,
-            Err(status) => return status.into_response(),
+            Err(status) => {
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.resolve_service", resolve_started.elapsed());
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.total", total_started.elapsed());
+                return status.into_response();
+            }
         };
+        state
+            .telemetry
+            .record_proxy_latency("proxy.resolve_service", resolve_started.elapsed());
 
+        let pick_started = Instant::now();
         let target_instance =
             match state
                 .proxy_handler
                 .pick_instance(&state, &address, &service_id, &service)
             {
                 Ok(inst) => inst,
-                Err((status, msg)) => return (status, msg).into_response(),
+                Err((status, msg)) => {
+                    state.telemetry.record_proxy_latency(
+                        "proxy.pick_healthy_instance",
+                        pick_started.elapsed(),
+                    );
+                    state
+                        .telemetry
+                        .record_proxy_latency("proxy.total", total_started.elapsed());
+                    return (status, msg).into_response();
+                }
             };
+        state
+            .telemetry
+            .record_proxy_latency("proxy.pick_healthy_instance", pick_started.elapsed());
 
         let target_uri = Self::prepare_target_uri(&state, &service, &path, target_instance);
 
-        Self::forward_request(target_uri, req, &address, middleware_result.forward_headers)
-            .await
-            .into_response()
+        let response = Self::forward_request(
+            target_uri,
+            req,
+            &address,
+            middleware_result.forward_headers,
+            Arc::clone(&state.telemetry),
+        )
+        .await
+        .into_response();
+
+        state
+            .telemetry
+            .record_proxy_latency("proxy.total", total_started.elapsed());
+        response
     }
 
     fn resolve_service(
@@ -254,6 +307,7 @@ impl ProxyHandler {
         req: Request,
         address: &String,
         forward_headers: HashMap<String, String>,
+        telemetry: Arc<crate::observability::RuntimeTelemetry>,
     ) -> impl IntoResponse {
         let client = reqwest::Client::new();
         let (parts, body) = req.into_parts();
@@ -281,17 +335,27 @@ impl ProxyHandler {
             proxy_req = proxy_req.header(name, value);
         }
 
+        let send_started = Instant::now();
         match proxy_req.send().await {
             Ok(resp) => {
+                telemetry
+                    .record_proxy_latency("proxy.send_upstream_request", send_started.elapsed());
                 let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
                 let mut builder = axum::response::Response::builder().status(status);
                 for (name, value) in resp.headers().iter() {
                     builder = builder.header(name, value);
                 }
+                let read_body_started = Instant::now();
                 let resp_body = Body::from(resp.bytes().await.unwrap_or_default());
+                telemetry.record_proxy_latency(
+                    "proxy.wait_upstream_response_body",
+                    read_body_started.elapsed(),
+                );
                 builder.body(resp_body).unwrap().into_response()
             }
             Err(e) => {
+                telemetry
+                    .record_proxy_latency("proxy.send_upstream_request", send_started.elapsed());
                 tracing::error!("Proxy error: {}", e);
                 StatusCode::BAD_GATEWAY.into_response()
             }

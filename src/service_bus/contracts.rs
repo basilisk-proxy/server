@@ -10,6 +10,9 @@ pub const BASILISK_SERVICE_ID: &str = "basilisk";
 /// External clients are prevented from claiming this instance_id.
 pub const BASILISK_INSTANCE_ID: &str = "lua-runtime";
 
+/// Canonical topic for service-emitted distribution metrics consumed by Basilisk.
+pub const BASILISK_METRICS_DISTRIBUTION_TOPIC: &str = "basilisk.metrics.distribution";
+
 /// Wire-level `type` values used by the service-bus protocol.
 pub mod protocol_types {
     pub const CONNECT: &str = "connect";

@@ -38,7 +38,6 @@ pub struct RoutingOptions {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RegistryOptions {
     pub heartbeat_timeout_seconds: u64,
-    pub health_check_interval_seconds: u64,
 }
 
 /// Security-related gateway policies.
@@ -63,6 +62,8 @@ pub struct ServiceBusOptions {
     pub host: String,
     pub port: u16,
     pub max_message_chars: usize,
+    pub connection_health_enabled: bool,
+    pub monitoring_enabled: bool,
 }
 
 impl Default for GatewayConfig {
@@ -83,7 +84,6 @@ impl Default for GatewayConfig {
             },
             registry: RegistryOptions {
                 heartbeat_timeout_seconds: 30,
-                health_check_interval_seconds: 10,
             },
             security: SecurityOptions {
                 service_registration_auth: "TOKEN".to_string(),
@@ -99,6 +99,8 @@ impl Default for GatewayConfig {
                 host: "0.0.0.0".to_string(),
                 port: 5090,
                 max_message_chars: 65536,
+                connection_health_enabled: true,
+                monitoring_enabled: false,
             },
         }
     }

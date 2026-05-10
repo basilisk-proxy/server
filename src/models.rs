@@ -20,7 +20,6 @@ pub struct ServiceInstance {
     pub host: String,
     pub port: u16,
     pub weight: i32,
-    pub health_check: String,
     pub status: InstanceStatus,
     pub active_connections: i32,
     pub last_heartbeat_utc: DateTime<Utc>,
@@ -48,8 +47,6 @@ pub struct RegistrationRequest {
     #[serde(rename = "serviceId")]
     pub service_id: String,
     pub fingerprint: String,
-    #[serde(rename = "healthCheck")]
-    pub health_check: String,
     #[serde(rename = "pathPrefixes")]
     pub path_prefixes: Vec<String>,
     pub instance: InstanceInfo,

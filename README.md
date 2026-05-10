@@ -50,7 +50,7 @@ Core modules:
   - `proxy.rs`: reverse proxy handler and load-balancing
 - `src/registry/`:
   - `mod.rs`: service registry storage and APIs
-  - `maintenance.rs`: health checking and stale cleanup loop
+  - `maintenance.rs`: metrics heartbeat evaluation and stale cleanup loop
 - `src/service_bus/`:
   - `contracts.rs`: protocol message types
   - `connection_manager.rs`: in-memory connection/subscription manager
@@ -171,6 +171,8 @@ basilisk.service_bus.port(5090)
 - `host(string)`
 - `port(number)`
 - `max_message_chars(number)`
+- `connection_health_enabled(boolean)` - if true, instance health is driven by bus auth/connect lifecycle
+- `monitoring_enabled(boolean)` - if true, Basilisk monitors `basilisk.metrics.distribution`
 - `publish(topic, payloadJsonObjectString)`
 - `subscribe(topic, handlerFn)` - subscribes Lua runtime to a topic; handler receives `event`
 - `unsubscribe(topic)` - removes Lua handler and topic subscription for the runtime
@@ -179,6 +181,21 @@ basilisk.service_bus.port(5090)
 ### 5.3 Lua service bus callbacks and forwarding
 
 The Lua runtime runs on a reserved bus identity (`service_id = "basilisk"`, `instance_id = "lua-runtime"`) that is pre-authenticated at startup.
+
+When `connection_health_enabled(true)` is set (default), instance health is updated from the service bus lifecycle:
+
+- successful `authenticate` => instance marked `Up`
+- bus disconnect ⇒ instance marked `Down`
+
+This provides a low-overhead online/offline signal without active HTTP probing.
+
+When `monitoring_enabled(true)` is set, Basilisk derives heartbeat from the last `basilisk.metrics.distribution` event seen per instance:
+
+- no recent metrics within timeout => `Down`
+- increasingly irregular metrics cadence => `Degraded`
+- recent stable cadence => `Up`
+
+This lets health reflect both liveness and rhythm stability of each service instance.
 
 ```lua
 basilisk.service_bus.subscribe("billing.events", function(event)
@@ -348,7 +365,6 @@ Example request:
 {
   "serviceId": "orders",
   "fingerprint": "orders-v1",
-  "healthCheck": "/health",
   "pathPrefixes": ["/api/orders"],
   "instance": {
     "instanceId": "orders-1",
@@ -369,15 +385,11 @@ Notes:
 - If `service_registration_auth == "TOKEN"`, `auth.type` must be `token` and token must match `registration_token`.
 - Path prefix ownership is exclusive across services.
 
-### 7.2 Heartbeat
-
-`POST /registry/heartbeat/{service_id}/{instance_id}`
-
-### 7.3 Deregister
+### 7.2 Deregister
 
 `DELETE /registry/services/{service_id}/instances/{instance_id}`
 
-### 7.4 Query
+### 7.3 Query
 
 - `GET /registry/services`
 - `GET /registry/services/{service_id}`
@@ -435,6 +447,8 @@ Transport: TCP, newline-delimited JSON messages.
 
 Server normalizes server-controlled event fields (`eventId`, `emittedAtUtc`, `serviceId`, `instanceId`, `correlationId`).
 
+If `monitoring_enabled(true)` is set, Basilisk monitors `basilisk.metrics.distribution` events and aggregates per-service distribution values in memory.
+
 ### 8.4 Forward request/response
 
 Forward request:
@@ -484,8 +498,8 @@ Forward response:
 
 Background task:
 
-- periodically runs active health checks
-- marks unhealthy instances as `Down`
+- evaluates metrics heartbeat cadence
+- marks stale heartbeats as `Down` and irregular cadence as `Degraded`
 - removes stale down instances beyond timeout
 
 ## 10. Common Use Cases
@@ -524,6 +538,8 @@ cargo test -- --nocapture
 - Registry and service buses are in-memory; state is not persisted across restarts.
 - Lua middleware runs in-process; panics or heavy logic can impact request latency.
 - `service_bus.max_message_chars` limits inbound line length per client message.
+- Runtime telemetry is available at `GET /registry/metrics/runtime`.
+- Proxy latency is aggregated by phase (`proxy.middleware`, `proxy.resolve_service`, `proxy.pick_healthy_instance`, `proxy.send_upstream_request`, `proxy.wait_upstream_response_body`, `proxy.total`).
 - TLS config fields exist in runtime config; bind/termination behavior depends on the current HTTP serving setup.
 
 ## 13. Troubleshooting
@@ -556,4 +572,4 @@ Check that:
 - Verify the route prefix and request path alignment.
 
 ### Proxy returns `503`
-- Verify at least one instance is `Up` and passing health checks.
+- Verify at least one instance is `Up` with recent, stable metrics heartbeat.

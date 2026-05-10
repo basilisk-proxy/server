@@ -1,9 +1,11 @@
 use crate::config::GatewayConfig;
+use crate::models::InstanceStatus;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use crate::service_bus::contracts::{
     protocol_types, ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
-    ServiceBusProtocolMessage, BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
+    ServiceBusProtocolMessage, BASILISK_INSTANCE_ID, BASILISK_METRICS_DISTRIBUTION_TOPIC,
+    BASILISK_SERVICE_ID,
 };
 use chrono::Utc;
 use std::collections::HashMap;
@@ -30,10 +32,19 @@ pub async fn run_server(
         let connection_manager = Arc::clone(&connection_manager);
         let registry = Arc::clone(&registry);
         let max_message_chars = config.service_bus.max_message_chars;
+        let connection_health_enabled = config.service_bus.connection_health_enabled;
+        let monitoring_enabled = config.service_bus.monitoring_enabled;
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_client(socket, connection_manager, registry, max_message_chars).await
+            if let Err(e) = handle_client(
+                socket,
+                connection_manager,
+                registry,
+                max_message_chars,
+                connection_health_enabled,
+                monitoring_enabled,
+            )
+            .await
             {
                 error!("Error handling client: {}", e);
             }
@@ -46,6 +57,8 @@ async fn handle_client(
     connection_manager: Arc<ConnectionManager>,
     registry: Arc<ServiceRegistry>,
     max_message_chars: usize,
+    connection_health_enabled: bool,
+    monitoring_enabled: bool,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
@@ -132,6 +145,12 @@ async fn handle_client(
                                     message: Some("Connected to service bus".to_string()),
                                     ..Default::default()
                                 });
+
+                                if monitoring_enabled {
+                                    connection_manager.subscribe_basilisk(vec![
+                                        BASILISK_METRICS_DISTRIBUTION_TOPIC.to_string(),
+                                    ]);
+                                }
                             }
                         }
                     }
@@ -141,6 +160,11 @@ async fn handle_client(
                                 if let Some((sid, iid)) = connection_manager.get_connection_info(key) {
                                     if registry.validate_instance_token(&sid, &iid, &token) {
                                         connection_manager.authenticate(key);
+                                        if connection_health_enabled {
+                                            registry
+                                                .update_instance_status(&sid, &iid, InstanceStatus::Up)
+                                                .await;
+                                        }
                                         let _ = tx.send(ServiceBusProtocolMessage {
                                             r#type: protocol_types::ACK.to_string(),
                                             message: Some("Authenticated".to_string()),
@@ -254,6 +278,13 @@ async fn handle_client(
     }
 
     if let Some(key) = connection_key {
+        if connection_health_enabled {
+            if let Some((sid, iid)) = connection_manager.get_connection_info(&key) {
+                registry
+                    .update_instance_status(&sid, &iid, InstanceStatus::Down)
+                    .await;
+            }
+        }
         connection_manager.remove_connection(&key);
     }
     Ok(())

@@ -9,7 +9,6 @@ fn registration_request(
     RegistrationRequest {
         service_id: service_id.to_string(),
         fingerprint: "fp-1".to_string(),
-        health_check: "http://localhost:18080/health".to_string(),
         path_prefixes: path_prefixes.into_iter().map(|v| v.to_string()).collect(),
         instance: InstanceInfo {
             instance_id: instance_id.to_string(),
@@ -26,12 +25,21 @@ fn registration_request(
 }
 
 #[tokio::test]
-async fn register_heartbeat_and_deregister_work_for_public_registry_api() {
+async fn register_and_deregister_work_for_public_registry_api() {
     let registry = ServiceRegistry::new();
     let request = registration_request("orders", "orders-1", vec!["/api/orders"]);
 
     let result = registry.register(request.clone()).await;
     assert!(result.success);
+
+    let service = registry
+        .get_service("orders")
+        .expect("orders service should exist after registration");
+    let instance = service
+        .instances
+        .get("orders-1")
+        .expect("orders-1 instance should exist");
+    assert_eq!(instance.status, InstanceStatus::Down);
 
     let token = result.token.expect("registration must return token");
     assert!(registry.validate_instance_token("orders", "orders-1", &token));
@@ -44,9 +52,7 @@ async fn register_heartbeat_and_deregister_work_for_public_registry_api() {
         Some("orders")
     );
 
-    assert!(registry.heartbeat("orders", "orders-1").await);
     assert!(registry.deregister("orders", "orders-1").await);
-    assert!(!registry.heartbeat("orders", "orders-1").await);
 }
 
 #[tokio::test]
@@ -90,4 +96,62 @@ async fn stale_down_instances_are_removed() {
         .get_service("billing")
         .expect("service should still exist");
     assert!(service.instances.is_empty());
+}
+
+#[tokio::test]
+async fn metrics_heartbeat_drives_up_and_stale_down_transitions() {
+    let registry = ServiceRegistry::new();
+    let request = registration_request("inventory", "inv-1", vec!["/api/inventory"]);
+    let result = registry.register(request).await;
+    assert!(result.success);
+
+    registry.record_metrics_heartbeat("inventory", "inv-1");
+    registry.evaluate_metrics_health(std::time::Duration::from_secs(5));
+
+    let service = registry
+        .get_service("inventory")
+        .expect("inventory service should exist");
+    let instance = service.instances.get("inv-1").expect("inv-1 should exist");
+    assert_eq!(instance.status, InstanceStatus::Up);
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    registry.evaluate_metrics_health(std::time::Duration::from_millis(1));
+
+    let service = registry
+        .get_service("inventory")
+        .expect("inventory service should exist");
+    let instance = service.instances.get("inv-1").expect("inv-1 should exist");
+    assert_eq!(instance.status, InstanceStatus::Down);
+}
+
+#[tokio::test]
+async fn metrics_heartbeat_irregularity_marks_instance_degraded() {
+    let registry = ServiceRegistry::new();
+    let request = registration_request("search", "search-1", vec!["/api/search"]);
+    let result = registry.register(request).await;
+    assert!(result.success);
+
+    // Establish a stable baseline cadence.
+    for _ in 0..5 {
+        registry.record_metrics_heartbeat("search", "search-1");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    registry.evaluate_metrics_health(std::time::Duration::from_secs(5));
+
+    // Introduce irregular cadence to simulate heartbeat instability.
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    registry.record_metrics_heartbeat("search", "search-1");
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    registry.record_metrics_heartbeat("search", "search-1");
+
+    registry.evaluate_metrics_health(std::time::Duration::from_secs(5));
+
+    let service = registry
+        .get_service("search")
+        .expect("search service should exist");
+    let instance = service
+        .instances
+        .get("search-1")
+        .expect("search-1 should exist");
+    assert_eq!(instance.status, InstanceStatus::Degraded);
 }

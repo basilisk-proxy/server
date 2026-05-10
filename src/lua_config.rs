@@ -638,6 +638,22 @@ fn make_service_bus_api(
         })?,
     )?;
 
+    let cfg = Arc::clone(&config);
+    table.set(
+        "connection_health_enabled",
+        lua.create_function(move |_, enabled: bool| {
+            with_config_mut(&cfg, |c| c.service_bus.connection_health_enabled = enabled)
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "monitoring_enabled",
+        lua.create_function(move |_, enabled: bool| {
+            with_config_mut(&cfg, |c| c.service_bus.monitoring_enabled = enabled)
+        })?,
+    )?;
+
     let cm = Arc::clone(&connection_manager);
     table.set(
         "publish",

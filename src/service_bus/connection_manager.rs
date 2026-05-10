@@ -2,12 +2,12 @@ use crate::service_bus::contracts::{
     ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
     ServiceBusProtocolMessage, BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
 };
+use crate::service_bus::helpers::get_headers_from_event;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use crate::service_bus::helpers::get_headers_from_event;
 
 /// Active service-bus connection metadata tracked by the broker.
 pub struct ServiceBusConnection {

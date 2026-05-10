@@ -3,7 +3,12 @@ use basilisk::service_bus::contracts::{
     protocol_types, ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusProtocolMessage,
     BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
 };
-use basilisk::{config::GatewayConfig, registry::ServiceRegistry, service_bus::server::run_server};
+use basilisk::{
+    config::GatewayConfig,
+    models::{AuthInfo, InstanceInfo, InstanceStatus, RegistrationRequest},
+    registry::ServiceRegistry,
+    service_bus::server::run_server,
+};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +34,19 @@ async fn start_test_bus_server(port: u16) -> tokio::task::JoinHandle<anyhow::Res
     config.service_bus.port = port;
     let manager = Arc::new(ConnectionManager::new());
     let registry = Arc::new(ServiceRegistry::new());
+    let handle = tokio::spawn(async move { run_server(config, manager, registry).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle
+}
+
+async fn start_test_bus_server_with_state(
+    port: u16,
+    manager: Arc<ConnectionManager>,
+    registry: Arc<ServiceRegistry>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let mut config = GatewayConfig::default();
+    config.service_bus.host = "127.0.0.1".to_string();
+    config.service_bus.port = port;
     let handle = tokio::spawn(async move { run_server(config, manager, registry).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     handle
@@ -65,6 +83,17 @@ async fn send_connect_and_read_reply(
         .await
         .expect("failed to read server response");
     serde_json::from_str(&line).expect("failed to parse server response")
+}
+
+async fn read_next_message(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> ServiceBusProtocolMessage {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .expect("failed to read server message");
+    serde_json::from_str(&line).expect("failed to parse server message")
 }
 
 #[tokio::test]
@@ -281,6 +310,123 @@ async fn server_rejects_reserved_instance_id_on_connect() {
 
     assert_eq!(response.r#type, protocol_types::ERROR);
     assert_eq!(response.error_code.as_deref(), Some("RESERVED_IDENTITY"));
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() {
+    let port = find_free_local_port();
+    let manager = Arc::new(ConnectionManager::new());
+    let registry = Arc::new(ServiceRegistry::new());
+
+    let reg_result = registry
+        .register(RegistrationRequest {
+            service_id: "orders".to_string(),
+            fingerprint: "fp-1".to_string(),
+            path_prefixes: vec!["/api/orders".to_string()],
+            instance: InstanceInfo {
+                instance_id: "orders-1".to_string(),
+                scheme: "http".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 18080,
+                weight: 1,
+            },
+            auth: AuthInfo {
+                r#type: "token".to_string(),
+                token: "token".to_string(),
+            },
+        })
+        .await;
+    assert!(reg_result.success);
+    let token = reg_result
+        .token
+        .expect("registration should return instance token");
+
+    let service = registry
+        .get_service("orders")
+        .expect("orders should exist after register");
+    let instance = service
+        .instances
+        .get("orders-1")
+        .expect("orders-1 should exist after register");
+    assert_eq!(instance.status, InstanceStatus::Down);
+
+    let handle =
+        start_test_bus_server_with_state(port, Arc::clone(&manager), Arc::clone(&registry)).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("failed to connect to bus server");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let connect = ServiceBusProtocolMessage {
+        r#type: protocol_types::CONNECT.to_string(),
+        service_id: Some("orders".to_string()),
+        instance_id: Some("orders-1".to_string()),
+        ..Default::default()
+    };
+    let mut connect_line = serde_json::to_string(&connect).expect("serialize connect");
+    connect_line.push('\n');
+    writer
+        .write_all(connect_line.as_bytes())
+        .await
+        .expect("write connect");
+    let connect_resp = read_next_message(&mut reader).await;
+    assert_eq!(connect_resp.r#type, protocol_types::ACK);
+
+    let authenticate = ServiceBusProtocolMessage {
+        r#type: protocol_types::AUTHENTICATE.to_string(),
+        token: Some(token),
+        ..Default::default()
+    };
+    let mut auth_line = serde_json::to_string(&authenticate).expect("serialize auth");
+    auth_line.push('\n');
+    writer
+        .write_all(auth_line.as_bytes())
+        .await
+        .expect("write auth");
+    let auth_resp = read_next_message(&mut reader).await;
+    assert_eq!(auth_resp.r#type, protocol_types::ACK);
+
+    timeout(Duration::from_millis(500), async {
+        loop {
+            let service = registry
+                .get_service("orders")
+                .expect("orders service should remain present");
+            let instance = service
+                .instances
+                .get("orders-1")
+                .expect("orders instance should remain present");
+            if instance.status == InstanceStatus::Up {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("instance should transition to Up after successful authentication");
+
+    drop(writer);
+
+    timeout(Duration::from_millis(500), async {
+        loop {
+            let service = registry
+                .get_service("orders")
+                .expect("orders service should remain present");
+            let instance = service
+                .instances
+                .get("orders-1")
+                .expect("orders instance should remain present");
+            if instance.status == InstanceStatus::Down {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("instance should transition to Down after disconnect");
 
     handle.abort();
 }

@@ -6,6 +6,7 @@ use basilisk::config::GatewayConfig;
 use basilisk::gateway::{proxy::ProxyHandler, routes, AppState};
 use basilisk::lua_config::LuaRuntime;
 use basilisk::models::{AuthInfo, InstanceInfo, RegistrationRequest};
+use basilisk::observability::RuntimeTelemetry;
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::ConnectionManager;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ fn test_state() -> Arc<AppState> {
         connection_manager: Arc::new(ConnectionManager::new()),
         proxy_handler: ProxyHandler::new(),
         lua_runtime: LuaRuntime::allow_all(),
+        telemetry: Arc::new(RuntimeTelemetry::new()),
     })
 }
 
@@ -24,7 +26,6 @@ fn registration_request(service_id: &str, instance_id: &str) -> RegistrationRequ
     RegistrationRequest {
         service_id: service_id.to_string(),
         fingerprint: "fp-1".to_string(),
-        health_check: "http://localhost:18080/health".to_string(),
         path_prefixes: vec!["/api/orders".to_string()],
         instance: InstanceInfo {
             instance_id: instance_id.to_string(),
@@ -62,14 +63,6 @@ async fn registry_routes_register_query_and_deregister_instances() {
         .into_response();
     assert_eq!(service_resp.status(), StatusCode::OK);
 
-    let heartbeat_resp = routes::heartbeat(
-        State(Arc::clone(&state)),
-        Path(("orders".to_string(), "orders-1".to_string())),
-    )
-    .await
-    .into_response();
-    assert_eq!(heartbeat_resp.status(), StatusCode::OK);
-
     let deregister_resp = routes::deregister(
         State(Arc::clone(&state)),
         Path(("orders".to_string(), "orders-1".to_string())),
@@ -90,4 +83,24 @@ async fn register_route_rejects_invalid_token() {
         .into_response();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn runtime_metrics_route_returns_snapshot_payload() {
+    let state = test_state();
+    state
+        .telemetry
+        .record_proxy_latency("proxy.middleware", std::time::Duration::from_millis(1));
+
+    let response = routes::get_runtime_metrics(State(state))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("failed to read metrics body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("body should be valid json");
+    assert!(json.get("proxy_latency").is_some());
+    assert!(json.get("service_distributions").is_some());
 }

@@ -4,11 +4,21 @@ pub use maintenance::run_maintenance;
 use crate::models::{InstanceStatus, RegistrationRequest, ServiceDefinition, ServiceInstance};
 use chrono::Utc;
 use dashmap::DashMap;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub struct ServiceRegistry {
     services: DashMap<String, ServiceDefinition>,
     path_owners: DashMap<String, String>,
+    metrics_heartbeat: DashMap<String, MetricsHeartbeatState>,
+}
+
+#[derive(Clone, Copy)]
+struct MetricsHeartbeatState {
+    last_seen_utc: chrono::DateTime<Utc>,
+    sample_count: u64,
+    ema_interval_ms: f64,
+    ema_jitter_ms: f64,
 }
 
 /// Result returned from a registration attempt.
@@ -25,6 +35,7 @@ impl ServiceRegistry {
         Self {
             services: DashMap::new(),
             path_owners: DashMap::new(),
+            metrics_heartbeat: DashMap::new(),
         }
     }
 
@@ -83,8 +94,9 @@ impl ServiceRegistry {
             host: request.instance.host,
             port: request.instance.port,
             weight: request.instance.weight,
-            health_check: request.health_check,
-            status: InstanceStatus::Up,
+            // Instance is considered healthy only after service-bus/metrics liveness
+            // evidence, not immediately at registration time.
+            status: InstanceStatus::Down,
             active_connections: 0,
             last_heartbeat_utc: Utc::now(),
         };
@@ -101,24 +113,97 @@ impl ServiceRegistry {
         }
     }
 
-    /// Marks an instance as alive and updates its heartbeat timestamp.
-    pub async fn heartbeat(&self, service_id: &str, instance_id: &str) -> bool {
-        if let Some(mut service) = self.services.get_mut(service_id) {
-            if let Some(instance) = service.instances.get_mut(instance_id) {
-                instance.last_heartbeat_utc = Utc::now();
-                instance.status = InstanceStatus::Up;
-                return true;
-            }
-        }
-        false
-    }
-
     /// Removes an instance from a service definition.
     pub async fn deregister(&self, service_id: &str, instance_id: &str) -> bool {
         if let Some(mut service) = self.services.get_mut(service_id) {
             return service.instances.remove(instance_id).is_some();
         }
         false
+    }
+
+    /// Records one metrics heartbeat sample emitted by an instance.
+    ///
+    /// This sample stream is used to derive liveness and heartbeat regularity.
+    pub fn record_metrics_heartbeat(&self, service_id: &str, instance_id: &str) {
+        if let Some(mut service) = self.services.get_mut(service_id) {
+            if let Some(instance) = service.instances.get_mut(instance_id) {
+                let now = Utc::now();
+                instance.last_heartbeat_utc = now;
+
+                let key = metrics_key(service_id, instance_id);
+                if let Some(mut hb) = self.metrics_heartbeat.get_mut(&key) {
+                    let interval_ms = now
+                        .signed_duration_since(hb.last_seen_utc)
+                        .num_milliseconds()
+                        .max(1) as f64;
+                    hb.sample_count += 1;
+                    if hb.sample_count == 2 {
+                        hb.ema_interval_ms = interval_ms;
+                        hb.ema_jitter_ms = 0.0;
+                    } else {
+                        let alpha = 0.25;
+                        hb.ema_interval_ms =
+                            alpha * interval_ms + (1.0 - alpha) * hb.ema_interval_ms;
+                        let jitter = (interval_ms - hb.ema_interval_ms).abs();
+                        hb.ema_jitter_ms = alpha * jitter + (1.0 - alpha) * hb.ema_jitter_ms;
+                    }
+                    hb.last_seen_utc = now;
+                } else {
+                    self.metrics_heartbeat.insert(
+                        key,
+                        MetricsHeartbeatState {
+                            last_seen_utc: now,
+                            sample_count: 1,
+                            ema_interval_ms: 0.0,
+                            ema_jitter_ms: 0.0,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Recomputes instance health from metrics heartbeat recency and regularity.
+    ///
+    /// - `Down` when heartbeat stops beyond timeout
+    /// - `Degraded` when heartbeat becomes irregular (high jitter)
+    /// - `Up` when cadence is recent and stable
+    pub fn evaluate_metrics_health(&self, timeout: Duration) {
+        let now = Utc::now();
+        let timeout_ms = timeout.as_millis() as f64;
+
+        for mut service in self.services.iter_mut() {
+            for instance in service.instances.values_mut() {
+                let key = metrics_key(&instance.service_id, &instance.instance_id);
+                let Some(hb) = self.metrics_heartbeat.get(&key) else {
+                    // No metrics observed yet for this instance.
+                    instance.status = InstanceStatus::Down;
+                    continue;
+                };
+
+                let silent_ms = now
+                    .signed_duration_since(hb.last_seen_utc)
+                    .num_milliseconds()
+                    .max(0) as f64;
+
+                if silent_ms > timeout_ms {
+                    instance.status = InstanceStatus::Down;
+                    continue;
+                }
+
+                let has_stable_baseline = hb.sample_count >= 5 && hb.ema_interval_ms > 0.0;
+                if has_stable_baseline {
+                    let jitter_ratio = hb.ema_jitter_ms / hb.ema_interval_ms;
+                    let cadence_gap_ratio = silent_ms / hb.ema_interval_ms;
+                    if jitter_ratio >= 0.4 || cadence_gap_ratio >= 2.5 {
+                        instance.status = InstanceStatus::Degraded;
+                        continue;
+                    }
+                }
+
+                instance.status = InstanceStatus::Up;
+            }
+        }
     }
 
     /// Returns a snapshot of all known services.
@@ -176,6 +261,8 @@ impl ServiceRegistry {
                 if instance.status == InstanceStatus::Down {
                     let elapsed = now.signed_duration_since(instance.last_heartbeat_utc);
                     if elapsed.to_std().unwrap_or(std::time::Duration::ZERO) > timeout {
+                        self.metrics_heartbeat
+                            .remove(&metrics_key(&instance.service_id, &instance.instance_id));
                         return false;
                     }
                 }
@@ -200,4 +287,8 @@ impl ServiceRegistry {
             }
         }
     }
+}
+
+fn metrics_key(service_id: &str, instance_id: &str) -> String {
+    format!("{}:{}", service_id, instance_id)
 }

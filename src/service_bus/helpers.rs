@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::service_bus::contracts::ServiceBusEventEnvelope;
+use std::collections::HashMap;
 
 pub(crate) fn get_headers_from_event(event: &ServiceBusEventEnvelope) -> HashMap<String, String> {
     event

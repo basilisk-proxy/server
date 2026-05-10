@@ -16,6 +16,8 @@ basilisk.service_bus.enabled(true)
 basilisk.service_bus.host("0.0.0.0")
 basilisk.service_bus.port(5090)
 basilisk.service_bus.max_message_chars(65536)
+basilisk.service_bus.connection_health_enabled(true)
+basilisk.service_bus.monitoring_enabled(true)
 
 -- Optional: load reusable Lua modules from the modules/ directory.
 -- Modules are loaded with require() and scoped to <entry-root>/modules/.

@@ -76,30 +76,6 @@ pub async fn register(
     }
 }
 
-/// Records heartbeat for a specific registered instance.
-pub async fn heartbeat(
-    State(state): State<Arc<AppState>>,
-    Path((service_id, instance_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    if state.registry.heartbeat(&service_id, &instance_id).await {
-        StatusCode::OK.into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: ErrorDetail {
-                    code: "INSTANCE_NOT_FOUND".to_string(),
-                    message: format!(
-                        "Instance '{}' for service '{}' not found",
-                        instance_id, service_id
-                    ),
-                },
-            }),
-        )
-            .into_response()
-    }
-}
-
 /// Deregisters a service instance.
 pub async fn deregister(
     State(state): State<Arc<AppState>>,
@@ -127,4 +103,9 @@ pub async fn get_service(
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+/// Returns runtime telemetry aggregated by the proxy server.
+pub async fn get_runtime_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.telemetry.snapshot())
 }

@@ -4,6 +4,7 @@ pub mod routes;
 use crate::config::GatewayConfig;
 use crate::gateway::proxy::ProxyHandler;
 use crate::lua_config::LuaRuntime;
+use crate::observability::RuntimeTelemetry;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
 use std::sync::Arc;
@@ -20,4 +21,6 @@ pub struct AppState {
     pub proxy_handler: ProxyHandler,
     /// Lua runtime hosting request middlewares.
     pub lua_runtime: Arc<LuaRuntime>,
+    /// Aggregated runtime telemetry (latencies + monitored service distributions).
+    pub telemetry: Arc<RuntimeTelemetry>,
 }
