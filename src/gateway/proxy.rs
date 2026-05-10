@@ -1,0 +1,345 @@
+use crate::gateway::AppState;
+use crate::models::{InstanceStatus, ServiceDefinition, ServiceInstance};
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use dashmap::DashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+pub struct ProxyHandler {
+    counters: DashMap<String, AtomicUsize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GatewayConfig;
+    use crate::gateway::AppState;
+    use crate::lua_config::LuaRuntime;
+    use crate::registry::ServiceRegistry;
+    use crate::service_bus::connection_manager::ConnectionManager;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_handle_proxy_not_found() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let config = GatewayConfig::default();
+        let connection_manager = Arc::new(ConnectionManager::new());
+        let proxy_handler = ProxyHandler::new();
+
+        let state = Arc::new(AppState {
+            config,
+            registry,
+            connection_manager,
+            proxy_handler,
+            lua_runtime: LuaRuntime::allow_all(),
+        });
+
+        let req = Request::builder()
+            .uri("/unknown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ProxyHandler::handle_proxy(State(state), req)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_handle_proxy_no_healthy_instances() {
+        let registry = Arc::new(ServiceRegistry::new());
+        let config = GatewayConfig::default();
+        let connection_manager = Arc::new(ConnectionManager::new());
+        let proxy_handler = ProxyHandler::new();
+
+        let service_id = "test-service".to_string();
+        registry
+            .register(crate::models::RegistrationRequest {
+                service_id: service_id.clone(),
+                fingerprint: "abc".to_string(),
+                health_check: "/health".to_string(),
+                path_prefixes: vec!["/api".to_string()],
+                instance: crate::models::InstanceInfo {
+                    instance_id: "inst-1".to_string(),
+                    scheme: "http".to_string(),
+                    host: "localhost".to_string(),
+                    port: 8080,
+                    weight: 1,
+                },
+                auth: crate::models::AuthInfo {
+                    r#type: "none".to_string(),
+                    token: "token".to_string(),
+                },
+            })
+            .await;
+
+        registry
+            .update_instance_status(&service_id, "inst-1", InstanceStatus::Down)
+            .await;
+
+        let state = Arc::new(AppState {
+            config,
+            registry,
+            connection_manager,
+            proxy_handler,
+            lua_runtime: LuaRuntime::allow_all(),
+        });
+
+        let req = Request::builder()
+            .uri("/api/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ProxyHandler::handle_proxy(State(state), req)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, "No healthy instances available");
+    }
+}
+
+impl ProxyHandler {
+    /// Creates a new proxy handler instance with per-service load-balancing counters.
+    pub fn new() -> Self {
+        Self {
+            counters: DashMap::new(),
+        }
+    }
+
+    /// Reverse-proxy fallback handler for all non-registry HTTP routes.
+    pub async fn handle_proxy(
+        State(state): State<Arc<AppState>>,
+        req: Request,
+    ) -> impl IntoResponse {
+        let path = req.uri().path().to_string();
+
+        let middleware_result =
+            match state
+                .lua_runtime
+                .run_middlewares(&path, req.method().as_str(), req.headers())
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::error!("Lua middleware execution failed: {}", err);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+        if let Some(reject) = middleware_result.short_circuit_response {
+            let mut builder = axum::response::Response::builder()
+                .status(StatusCode::from_u16(reject.status).unwrap_or(StatusCode::UNAUTHORIZED));
+            for (k, v) in reject.headers {
+                builder = builder.header(k, v);
+            }
+            return builder
+                .body(Body::from(reject.body))
+                .unwrap_or_else(|_| axum::response::Response::new(Body::from("Unauthorized")));
+        }
+
+        let (service_id, service) = match Self::resolve_service(&state, &path) {
+            Ok(res) => res,
+            Err(status) => return status.into_response(),
+        };
+
+        let target_instance = match state
+            .proxy_handler
+            .pick_instance(&state, &service_id, &service)
+        {
+            Ok(inst) => inst,
+            Err((status, msg)) => return (status, msg).into_response(),
+        };
+
+        let target_uri = Self::prepare_target_uri(&state, &service, &path, target_instance);
+
+        Self::forward_request(target_uri, req, middleware_result.forward_headers)
+            .await
+            .into_response()
+    }
+
+    fn resolve_service(
+        state: &AppState,
+        path: &str,
+    ) -> Result<(String, ServiceDefinition), StatusCode> {
+        let service_id = state
+            .registry
+            .resolve_service_by_path(path)
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+        let service = state
+            .registry
+            .get_service(&service_id)
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+        Ok((service_id, service))
+    }
+
+    fn pick_instance<'a>(
+        &self,
+        state: &AppState,
+        service_id: &str,
+        service: &'a ServiceDefinition,
+    ) -> Result<&'a ServiceInstance, (StatusCode, &'static str)> {
+        let healthy_instances: Vec<_> = service
+            .instances
+            .values()
+            .filter(|i| i.status == InstanceStatus::Up)
+            .collect();
+
+        if healthy_instances.is_empty() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No healthy instances available",
+            ));
+        }
+
+        let strategy = &state.config.routing.default_load_balancing_strategy;
+        let target_instance = match strategy.as_str() {
+            "WEIGHTED_ROUND_ROBIN" => {
+                self.pick_weighted_round_robin(service_id, &healthy_instances)
+            }
+            "WEIGHTED_RANDOM" => self.pick_weighted_random(&healthy_instances),
+            "IP_HASH" => self.pick_ip_hash("unknown", &healthy_instances),
+            _ => self.pick_round_robin(service_id, &healthy_instances),
+        };
+        Ok(target_instance)
+    }
+
+    fn prepare_target_uri(
+        state: &AppState,
+        service: &ServiceDefinition,
+        path: &str,
+        instance: &ServiceInstance,
+    ) -> String {
+        let mut final_path = path;
+        if state.config.routing.strip_prefix {
+            if let Some(prefix) = service.path_prefixes.iter().find(|p| path.starts_with(*p)) {
+                final_path = &path[prefix.len()..];
+            }
+        }
+        let stripped = final_path.strip_prefix('/').unwrap_or(final_path);
+        format!("{}/{}", instance.to_uri(), stripped)
+    }
+
+    async fn forward_request(
+        target_uri: String,
+        req: Request,
+        forward_headers: HashMap<String, String>,
+    ) -> impl IntoResponse {
+        let client = reqwest::Client::new();
+        let (parts, body) = req.into_parts();
+
+        let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+            Ok(b) => b,
+            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        };
+
+        let mut proxy_req = client
+            .request(parts.method.clone(), &target_uri)
+            .body(body_bytes);
+
+        for (name, value) in parts.headers.iter() {
+            if name != "host" {
+                proxy_req = proxy_req.header(name, value);
+            }
+        }
+
+        // Apply forward headers from middleware
+        for (name, value) in forward_headers.iter() {
+            proxy_req = proxy_req.header(name, value);
+        }
+
+        match proxy_req.send().await {
+            Ok(resp) => {
+                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+                let mut builder = axum::response::Response::builder().status(status);
+                for (name, value) in resp.headers().iter() {
+                    builder = builder.header(name, value);
+                }
+                let resp_body = Body::from(resp.bytes().await.unwrap_or_default());
+                builder.body(resp_body).unwrap().into_response()
+            }
+            Err(e) => {
+                tracing::error!("Proxy error: {}", e);
+                StatusCode::BAD_GATEWAY.into_response()
+            }
+        }
+    }
+
+    fn pick_round_robin<'a>(
+        &self,
+        service_id: &str,
+        instances: &[&'a ServiceInstance],
+    ) -> &'a ServiceInstance {
+        let counter = self
+            .counters
+            .entry(service_id.to_string())
+            .or_insert_with(|| AtomicUsize::new(0));
+        let index = counter.fetch_add(1, Ordering::SeqCst) % instances.len();
+        instances[index]
+    }
+
+    fn pick_weighted_round_robin<'a>(
+        &self,
+        service_id: &str,
+        instances: &[&'a ServiceInstance],
+    ) -> &'a ServiceInstance {
+        let total_weight: i32 = instances.iter().map(|i| i.weight).sum();
+        if total_weight <= 0 {
+            return instances[0];
+        }
+
+        let counter = self
+            .counters
+            .entry(service_id.to_string())
+            .or_insert_with(|| AtomicUsize::new(0));
+        let current_val = counter.fetch_add(1, Ordering::SeqCst) % total_weight as usize;
+
+        let mut running_weight = 0;
+        for instance in instances {
+            running_weight += instance.weight;
+            if current_val < running_weight as usize {
+                return instance;
+            }
+        }
+        instances[0]
+    }
+
+    fn pick_weighted_random<'a>(&self, instances: &[&'a ServiceInstance]) -> &'a ServiceInstance {
+        let total_weight: i32 = instances.iter().map(|i| i.weight).sum();
+        if total_weight <= 0 {
+            return instances[0];
+        }
+
+        let pick = (rand::random::<u32>() % total_weight as u32) as i32;
+        let mut running_weight = 0;
+        for instance in instances {
+            running_weight += instance.weight;
+            if pick < running_weight {
+                return instance;
+            }
+        }
+        instances[0]
+    }
+
+    fn pick_ip_hash<'a>(&self, ip: &str, instances: &[&'a ServiceInstance]) -> &'a ServiceInstance {
+        let mut hasher = DefaultHasher::new();
+        ip.hash(&mut hasher);
+        let index = (hasher.finish() as usize) % instances.len();
+        instances[index]
+    }
+}

@@ -1,0 +1,51 @@
+-- Core server settings
+basilisk.server.host("0.0.0.0")
+basilisk.server.port(8080)
+basilisk.server.tls_enabled(false)
+
+-- Gateway / proxy settings
+basilisk.gateway.load_balancing_strategy("ROUND_ROBIN")
+basilisk.gateway.strip_prefix(false)
+
+-- Security settings
+basilisk.security.service_registration_auth("TOKEN")
+basilisk.security.registration_token("secret-token")
+
+-- Service bus settings
+basilisk.service_bus.enabled(true)
+basilisk.service_bus.host("0.0.0.0")
+basilisk.service_bus.port(5090)
+basilisk.service_bus.max_message_chars(65536)
+
+-- Optional: load reusable Lua modules from the modules/ directory.
+-- Modules are loaded with require() and scoped to <entry-root>/modules/.
+-- Example: local auth = require("auth")
+--
+-- To split large configs while keeping this file as the entrypoint, use:
+-- load_lua_file("config/routes.lua")
+
+-- Example: bind static route ownership in the registry
+basilisk.registry.bind_path("/api/orders", "orders-service")
+
+-- Example: middleware storing context and forwarding auth headers
+basilisk.proxy.use(function(req, res, next)
+  -- Perform authentication and store in context
+  local auth_token = req.headers["authorization"]
+  if auth_token then
+    req.ctx["auth_token"] = auth_token
+  end
+  return next()
+end)
+
+-- Example: custom middleware mounted on selected path prefix
+basilisk.proxy.use("/api/private", function(req, res, next)
+  if not req.ctx["auth_token"] then
+    return res:status(401)
+      :set("www-authenticate", "Bearer")
+      :send("unauthorized")
+  end
+
+  -- Forward authentication header to downstream service
+  res:forward_headers("Authorization", req.ctx["auth_token"])
+  return next()
+end)
