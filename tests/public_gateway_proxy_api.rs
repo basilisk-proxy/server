@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use basilisk::config::GatewayConfig;
@@ -8,6 +8,7 @@ use basilisk::lua_config::load_config_and_runtime;
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::ConnectionManager;
 use std::fs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -47,12 +48,14 @@ async fn proxy_handler_applies_lua_middleware_before_route_resolution() {
         lua_runtime,
     });
 
+    let socket_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
     let req = Request::builder()
         .uri("/blocked/test")
         .body(Body::empty())
         .expect("failed to build request");
 
-    let resp = ProxyHandler::handle_proxy(State(state), req)
+    let resp = ProxyHandler::handle_proxy(State(state), ConnectInfo(socket_addr), req)
         .await
         .into_response();
 

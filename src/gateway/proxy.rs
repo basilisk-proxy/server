@@ -1,5 +1,6 @@
 use crate::gateway::AppState;
 use crate::models::{InstanceStatus, ServiceDefinition, ServiceInstance};
+use axum::extract::ConnectInfo;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -9,6 +10,7 @@ use axum::{
 use dashmap::DashMap;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -45,12 +47,14 @@ mod tests {
             lua_runtime: LuaRuntime::allow_all(),
         });
 
+        let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
+
         let req = Request::builder()
             .uri("/unknown")
             .body(Body::empty())
             .unwrap();
 
-        let response = ProxyHandler::handle_proxy(State(state), req)
+        let response = ProxyHandler::handle_proxy(State(state), ConnectInfo(connect_info), req)
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -96,12 +100,14 @@ mod tests {
             lua_runtime: LuaRuntime::allow_all(),
         });
 
+        let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
+
         let req = Request::builder()
             .uri("/api/test")
             .body(Body::empty())
             .unwrap();
 
-        let response = ProxyHandler::handle_proxy(State(state), req)
+        let response = ProxyHandler::handle_proxy(State(state), ConnectInfo(connect_info), req)
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -124,9 +130,15 @@ impl ProxyHandler {
     /// Reverse-proxy fallback handler for all non-registry HTTP routes.
     pub async fn handle_proxy(
         State(state): State<Arc<AppState>>,
+        ConnectInfo(connect_info): ConnectInfo<SocketAddr>,
         req: Request,
     ) -> impl IntoResponse {
         let path = req.uri().path().to_string();
+        let ip_address = connect_info.ip().to_canonical();
+        let address = match ip_address {
+            IpAddr::V4(raw) => format!("{}:{}", raw, connect_info.port()),
+            IpAddr::V6(raw) => format!("[{}]:{}", raw, connect_info.port()),
+        };
 
         let middleware_result =
             match state
@@ -156,17 +168,18 @@ impl ProxyHandler {
             Err(status) => return status.into_response(),
         };
 
-        let target_instance = match state
-            .proxy_handler
-            .pick_instance(&state, &service_id, &service)
-        {
-            Ok(inst) => inst,
-            Err((status, msg)) => return (status, msg).into_response(),
-        };
+        let target_instance =
+            match state
+                .proxy_handler
+                .pick_instance(&state, &address, &service_id, &service)
+            {
+                Ok(inst) => inst,
+                Err((status, msg)) => return (status, msg).into_response(),
+            };
 
         let target_uri = Self::prepare_target_uri(&state, &service, &path, target_instance);
 
-        Self::forward_request(target_uri, req, middleware_result.forward_headers)
+        Self::forward_request(target_uri, req, &address, middleware_result.forward_headers)
             .await
             .into_response()
     }
@@ -191,6 +204,7 @@ impl ProxyHandler {
     fn pick_instance<'a>(
         &self,
         state: &AppState,
+        address: &String,
         service_id: &str,
         service: &'a ServiceDefinition,
     ) -> Result<&'a ServiceInstance, (StatusCode, &'static str)> {
@@ -213,7 +227,7 @@ impl ProxyHandler {
                 self.pick_weighted_round_robin(service_id, &healthy_instances)
             }
             "WEIGHTED_RANDOM" => self.pick_weighted_random(&healthy_instances),
-            "IP_HASH" => self.pick_ip_hash("unknown", &healthy_instances),
+            "IP_HASH" => self.pick_ip_hash(address.as_str(), &healthy_instances),
             _ => self.pick_round_robin(service_id, &healthy_instances),
         };
         Ok(target_instance)
@@ -238,6 +252,7 @@ impl ProxyHandler {
     async fn forward_request(
         target_uri: String,
         req: Request,
+        address: &String,
         forward_headers: HashMap<String, String>,
     ) -> impl IntoResponse {
         let client = reqwest::Client::new();
@@ -251,6 +266,9 @@ impl ProxyHandler {
         let mut proxy_req = client
             .request(parts.method.clone(), &target_uri)
             .body(body_bytes);
+
+        // Set the IP information of the original forwarding address
+        proxy_req = proxy_req.header("X-Forwarded-For", address);
 
         for (name, value) in parts.headers.iter() {
             if name != "host" {
