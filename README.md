@@ -35,7 +35,7 @@ Basilisk runs two server surfaces in one process:
    - Reverse-proxy fallback for all non-registry paths
 2. **TCP service bus**:
    - Line-delimited JSON protocol
-   - Client connect/auth/subscribe/publish/forward operations
+   - Client connect/authenticated-subscribe/publish/forward operations
 
 Both surfaces share an in-memory `ServiceRegistry` and `ConnectionManager`.
 
@@ -221,7 +221,8 @@ The Lua runtime runs on a reserved bus identity (`service_id = "basilisk"`, `ins
 
 When `connection_health_enabled(true)` is set (default), instance health is updated from the service bus lifecycle:
 
-- successful `authenticate` => instance marked `Up`
+- successful `connect` with a valid token => instance marked `Up`
+- `authenticate` remains available for compatibility, but is no longer required for normal clients
 - bus disconnect ⇒ instance marked `Down`
 
 This provides a low-overhead online/offline signal without active HTTP probing.
@@ -452,7 +453,7 @@ Example request:
   "fingerprint": "orders-v1",
   "pathPrefixes": ["/api/orders"],
   "instance": {
-    "instanceId": "orders-1",
+    "instanceId": "",
     "scheme": "http",
     "host": "127.0.0.1",
     "port": 7001,
@@ -469,6 +470,7 @@ Notes:
 
 - If `service_registration_auth == "TOKEN"`, `auth.type` must be `token` and token must match `registration_token`.
 - Path prefix ownership is exclusive across services.
+- If `instance.instanceId` is empty, Basilisk generates a cryptographically secure instance ID and returns it in the registration response.
 
 ### 7.2 Deregister
 
@@ -498,14 +500,12 @@ Transport: TCP, newline-delimited JSON messages.
 ### 8.2 Connect/auth flow
 
 ```json
-{ "type": "connect", "serviceId": "orders", "instanceId": "orders-1" }
-```
-
-```json
-{ "type": "authenticate", "token": "<registration-token-issued-by-registry>" }
+{ "type": "connect", "serviceId": "orders", "instanceId": "<generated-instance-id>", "token": "<registration-token-issued-by-registry>" }
 ```
 
 `serviceId = "basilisk"` and `instanceId = "lua-runtime"` are reserved by the runtime and cannot be used by external clients. A connect attempt using either value is rejected with `errorCode = "RESERVED_IDENTITY"`.
+
+The service bus validates the registration token during `connect`, so authenticated clients establish a usable connection in one round-trip.
 
 ### 8.3 Subscribe/publish
 
@@ -593,7 +593,7 @@ Background task:
 - Route traffic by prefix ownership.
 
 ### 10.2 Lightweight service-to-service event bus
-- Connect/authenticate service instances.
+- Connect service instances with a valid registration token in a single handshake.
 - Subscribe to topic namespaces.
 - Publish typed events with correlation IDs.
 

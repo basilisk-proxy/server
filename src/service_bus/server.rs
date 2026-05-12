@@ -112,8 +112,8 @@ async fn handle_client(
                                 message: Some("Connection is already established".to_string()),
                                 ..Default::default()
                             });
-                        } else if let (Some(sid), Some(iid)) =
-                            (msg.service_id.clone(), msg.instance_id.clone())
+                        } else if let (Some(sid), Some(iid), Some(token)) =
+                            (msg.service_id.clone(), msg.instance_id.clone(), msg.token.clone())
                         {
                             // Reject attempts to impersonate the reserved basilisk identity.
                             if sid == BASILISK_SERVICE_ID || iid == BASILISK_INSTANCE_ID {
@@ -126,23 +126,36 @@ async fn handle_client(
                                     )),
                                     ..Default::default()
                                 });
+                            } else if !registry.validate_instance_token(&sid, &iid, &token) {
+                                let _ = tx.send(ServiceBusProtocolMessage {
+                                    r#type: protocol_types::ERROR.to_string(),
+                                    error_code: Some("AUTH_FAILED".to_string()),
+                                    message: Some("Authentication failed".to_string()),
+                                    ..Default::default()
+                                });
                             } else {
                                 let key = format!("{}:{}", sid, iid);
                                 connection_key = Some(key.clone());
                                 connection_manager.add_connection(
                                     key.clone(),
                                     ServiceBusConnection {
-                                        service_id: sid,
-                                        instance_id: iid,
+                                        service_id: sid.clone(),
+                                        instance_id: iid.clone(),
                                         tx: tx.clone(),
-                                        authenticated: false,
+                                        authenticated: true,
                                         subscriptions: Vec::new(),
                                     },
                                 );
 
+                                if connection_health_enabled {
+                                    registry
+                                        .update_instance_status(&sid, &iid, InstanceStatus::Up)
+                                        .await;
+                                }
+
                                 let _ = tx.send(ServiceBusProtocolMessage {
                                     r#type: protocol_types::ACK.to_string(),
-                                    message: Some("Connected to service bus".to_string()),
+                                    message: Some("Connected and authenticated to service bus".to_string()),
                                     ..Default::default()
                                 });
 
@@ -152,11 +165,24 @@ async fn handle_client(
                                     ]);
                                 }
                             }
+                        } else {
+                            let _ = tx.send(ServiceBusProtocolMessage {
+                                r#type: protocol_types::ERROR.to_string(),
+                                error_code: Some("AUTH_REQUIRED".to_string()),
+                                message: Some("Connect requires serviceId, instanceId, and token".to_string()),
+                                ..Default::default()
+                            });
                         }
                     }
                     protocol_types::AUTHENTICATE => {
                         if let Some(key) = &connection_key {
-                            if let Some(token) = msg.token {
+                            if connection_manager.is_authenticated(key) {
+                                let _ = tx.send(ServiceBusProtocolMessage {
+                                    r#type: protocol_types::ACK.to_string(),
+                                    message: Some("Already authenticated".to_string()),
+                                    ..Default::default()
+                                });
+                            } else if let Some(token) = msg.token {
                                 if let Some((sid, iid)) = connection_manager.get_connection_info(key) {
                                     if registry.validate_instance_token(&sid, &iid, &token) {
                                         connection_manager.authenticate(key);
@@ -179,6 +205,13 @@ async fn handle_client(
                                         });
                                     }
                                 }
+                            } else {
+                                let _ = tx.send(ServiceBusProtocolMessage {
+                                    r#type: protocol_types::ERROR.to_string(),
+                                    error_code: Some("AUTH_REQUIRED".to_string()),
+                                    message: Some("Authentication token is required".to_string()),
+                                    ..Default::default()
+                                });
                             }
                         }
                     }

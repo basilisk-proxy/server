@@ -24,6 +24,7 @@ struct MetricsHeartbeatState {
 /// Result returned from a registration attempt.
 pub struct RegistrationResult {
     pub success: bool,
+    pub instance_id: Option<String>,
     pub token: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -47,12 +48,19 @@ impl ServiceRegistry {
 
     /// Registers a service instance and reserves declared route prefixes.
     pub async fn register(&self, request: RegistrationRequest) -> RegistrationResult {
+        let instance_id = if request.instance.instance_id.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            request.instance.instance_id.clone()
+        };
+
         // 1. Check for prefix collisions
         for prefix in &request.path_prefixes {
             if let Some(owner) = self.path_owners.get(prefix) {
                 if owner.value() != &request.service_id {
                     return RegistrationResult {
                         success: false,
+                        instance_id: None,
                         token: None,
                         error_code: Some("ROUTE_COLLISION".to_string()),
                         error_message: Some(format!(
@@ -85,6 +93,7 @@ impl ServiceRegistry {
         if service.fingerprint != request.fingerprint {
             return RegistrationResult {
                 success: false,
+                instance_id: None,
                 token: None,
                 error_code: Some("FINGERPRINT_INVALID".to_string()),
                 error_message: Some("Fingerprint mismatch".to_string()),
@@ -93,7 +102,7 @@ impl ServiceRegistry {
 
         let token = Uuid::new_v4().to_string();
         let instance = ServiceInstance {
-            instance_id: request.instance.instance_id.clone(),
+            instance_id: instance_id.clone(),
             service_id: request.service_id.clone(),
             token: token.clone(),
             scheme: request.instance.scheme,
@@ -107,12 +116,11 @@ impl ServiceRegistry {
             last_heartbeat_utc: Utc::now(),
         };
 
-        service
-            .instances
-            .insert(request.instance.instance_id, instance);
+        service.instances.insert(instance_id.clone(), instance);
 
         RegistrationResult {
             success: true,
+            instance_id: Some(instance_id),
             token: Some(token),
             error_code: None,
             error_message: None,

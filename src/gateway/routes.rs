@@ -52,6 +52,7 @@ pub async fn register(
             Json(serde_json::json!({
                 "message": "Service instance registered successfully",
                 "serviceId": request.service_id,
+                "instanceId": result.instance_id.unwrap(),
                 "token": result.token.unwrap()
             })),
         )

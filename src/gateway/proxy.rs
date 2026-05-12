@@ -445,10 +445,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_proxy_no_healthy_instances() {
-        let registry = Arc::new(ServiceRegistry::new());
+        let state = test_state();
 
         let service_id = "test-service".to_string();
-        registry
+        state
+            .registry
             .register(crate::models::RegistrationRequest {
                 service_id: service_id.clone(),
                 fingerprint: "abc".to_string(),
@@ -467,11 +468,11 @@ mod tests {
             })
             .await;
 
-        registry
+        state
+            .registry
             .update_instance_status(&service_id, "inst-1", InstanceStatus::Down)
             .await;
 
-        let state = test_state();
 
         let connect_info = SocketAddr::from(([127, 0, 0, 1], 8080));
 

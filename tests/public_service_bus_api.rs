@@ -56,6 +56,7 @@ async fn send_connect_and_read_reply(
     port: u16,
     service_id: &str,
     instance_id: &str,
+    token: &str,
 ) -> ServiceBusProtocolMessage {
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -67,6 +68,7 @@ async fn send_connect_and_read_reply(
         r#type: protocol_types::CONNECT.to_string(),
         service_id: Some(service_id.to_string()),
         instance_id: Some(instance_id.to_string()),
+        token: Some(token.to_string()),
         ..Default::default()
     };
 
@@ -288,7 +290,8 @@ async fn server_rejects_reserved_service_id_on_connect() {
     let port = find_free_local_port();
     let handle = start_test_bus_server(port).await;
 
-    let response = send_connect_and_read_reply(port, BASILISK_SERVICE_ID, "any-instance").await;
+    let response =
+        send_connect_and_read_reply(port, BASILISK_SERVICE_ID, "any-instance", "token").await;
 
     assert_eq!(response.r#type, protocol_types::ERROR);
     assert_eq!(response.error_code.as_deref(), Some("RESERVED_IDENTITY"));
@@ -302,7 +305,7 @@ async fn server_rejects_reserved_instance_id_on_connect() {
     let handle = start_test_bus_server(port).await;
 
     let response =
-        send_connect_and_read_reply(port, "external-service", BASILISK_INSTANCE_ID).await;
+        send_connect_and_read_reply(port, "external-service", BASILISK_INSTANCE_ID, "token").await;
 
     assert_eq!(response.r#type, protocol_types::ERROR);
     assert_eq!(response.error_code.as_deref(), Some("RESERVED_IDENTITY"));
@@ -361,6 +364,7 @@ async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() 
         r#type: protocol_types::CONNECT.to_string(),
         service_id: Some("orders".to_string()),
         instance_id: Some("orders-1".to_string()),
+        token: Some(token),
         ..Default::default()
     };
     let mut connect_line = serde_json::to_string(&connect).expect("serialize connect");
@@ -371,20 +375,6 @@ async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() 
         .expect("write connect");
     let connect_resp = read_next_message(&mut reader).await;
     assert_eq!(connect_resp.r#type, protocol_types::ACK);
-
-    let authenticate = ServiceBusProtocolMessage {
-        r#type: protocol_types::AUTHENTICATE.to_string(),
-        token: Some(token),
-        ..Default::default()
-    };
-    let mut auth_line = serde_json::to_string(&authenticate).expect("serialize auth");
-    auth_line.push('\n');
-    writer
-        .write_all(auth_line.as_bytes())
-        .await
-        .expect("write auth");
-    let auth_resp = read_next_message(&mut reader).await;
-    assert_eq!(auth_resp.r#type, protocol_types::ACK);
 
     timeout(Duration::from_millis(500), async {
         loop {

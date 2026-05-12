@@ -1,17 +1,13 @@
 use basilisk::models::{AuthInfo, InstanceInfo, InstanceStatus, RegistrationRequest};
 use basilisk::registry::ServiceRegistry;
 
-fn registration_request(
-    service_id: &str,
-    instance_id: &str,
-    path_prefixes: Vec<&str>,
-) -> RegistrationRequest {
+fn registration_request(service_id: &str, path_prefixes: Vec<&str>) -> RegistrationRequest {
     RegistrationRequest {
         service_id: service_id.to_string(),
         fingerprint: "fp-1".to_string(),
         path_prefixes: path_prefixes.into_iter().map(|v| v.to_string()).collect(),
         instance: InstanceInfo {
-            instance_id: instance_id.to_string(),
+            instance_id: String::new(),
             scheme: "http".to_string(),
             host: "localhost".to_string(),
             port: 18080,
@@ -27,22 +23,25 @@ fn registration_request(
 #[tokio::test]
 async fn register_and_deregister_work_for_public_registry_api() {
     let registry = ServiceRegistry::new();
-    let request = registration_request("orders", "orders-1", vec!["/api/orders"]);
+    let request = registration_request("orders", vec!["/api/orders"]);
 
     let result = registry.register(request.clone()).await;
     assert!(result.success);
+    let instance_id = result
+        .instance_id
+        .expect("registration must return instance id");
 
     let service = registry
         .get_service("orders")
         .expect("orders service should exist after registration");
     let instance = service
         .instances
-        .get("orders-1")
-        .expect("orders-1 instance should exist");
+        .get(&instance_id)
+        .expect("generated instance should exist");
     assert_eq!(instance.status, InstanceStatus::Down);
 
     let token = result.token.expect("registration must return token");
-    assert!(registry.validate_instance_token("orders", "orders-1", &token));
+    assert!(registry.validate_instance_token("orders", &instance_id, &token));
     assert!(registry.validate_any_instance_token("orders", &token));
 
     assert_eq!(
@@ -52,18 +51,18 @@ async fn register_and_deregister_work_for_public_registry_api() {
         Some("orders")
     );
 
-    assert!(registry.deregister("orders", "orders-1").await);
+    assert!(registry.deregister("orders", &instance_id).await);
 }
 
 #[tokio::test]
 async fn route_collision_and_longest_prefix_resolution_are_enforced() {
     let registry = ServiceRegistry::new();
 
-    let first = registration_request("svc-a", "a-1", vec!["/api"]);
+    let first = registration_request("svc-a", vec!["/api"]);
     let first_result = registry.register(first).await;
     assert!(first_result.success);
 
-    let colliding = registration_request("svc-b", "b-1", vec!["/api"]);
+    let colliding = registration_request("svc-b", vec!["/api"]);
     let colliding_result = registry.register(colliding).await;
     assert!(!colliding_result.success);
     assert_eq!(
@@ -83,12 +82,15 @@ async fn route_collision_and_longest_prefix_resolution_are_enforced() {
 #[tokio::test]
 async fn stale_down_instances_are_removed() {
     let registry = ServiceRegistry::new();
-    let request = registration_request("billing", "bill-1", vec!["/api/billing"]);
+    let request = registration_request("billing", vec!["/api/billing"]);
     let result = registry.register(request).await;
     assert!(result.success);
+    let instance_id = result
+        .instance_id
+        .expect("registration must return instance id");
 
     registry
-        .update_instance_status("billing", "bill-1", InstanceStatus::Down)
+        .update_instance_status("billing", &instance_id, InstanceStatus::Down)
         .await;
     registry.remove_stale_instances(std::time::Duration::ZERO);
 
@@ -101,17 +103,23 @@ async fn stale_down_instances_are_removed() {
 #[tokio::test]
 async fn metrics_heartbeat_drives_up_and_stale_down_transitions() {
     let registry = ServiceRegistry::new();
-    let request = registration_request("inventory", "inv-1", vec!["/api/inventory"]);
+    let request = registration_request("inventory", vec!["/api/inventory"]);
     let result = registry.register(request).await;
     assert!(result.success);
+    let instance_id = result
+        .instance_id
+        .expect("registration must return instance id");
 
-    registry.record_metrics_heartbeat("inventory", "inv-1");
+    registry.record_metrics_heartbeat("inventory", &instance_id);
     registry.evaluate_metrics_health(std::time::Duration::from_secs(5));
 
     let service = registry
         .get_service("inventory")
         .expect("inventory service should exist");
-    let instance = service.instances.get("inv-1").expect("inv-1 should exist");
+    let instance = service
+        .instances
+        .get(&instance_id)
+        .expect("generated instance should exist");
     assert_eq!(instance.status, InstanceStatus::Up);
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -120,29 +128,35 @@ async fn metrics_heartbeat_drives_up_and_stale_down_transitions() {
     let service = registry
         .get_service("inventory")
         .expect("inventory service should exist");
-    let instance = service.instances.get("inv-1").expect("inv-1 should exist");
+    let instance = service
+        .instances
+        .get(&instance_id)
+        .expect("generated instance should exist");
     assert_eq!(instance.status, InstanceStatus::Down);
 }
 
 #[tokio::test]
 async fn metrics_heartbeat_irregularity_marks_instance_degraded() {
     let registry = ServiceRegistry::new();
-    let request = registration_request("search", "search-1", vec!["/api/search"]);
+    let request = registration_request("search", vec!["/api/search"]);
     let result = registry.register(request).await;
     assert!(result.success);
+    let instance_id = result
+        .instance_id
+        .expect("registration must return instance id");
 
     // Establish a stable baseline cadence.
     for _ in 0..5 {
-        registry.record_metrics_heartbeat("search", "search-1");
+        registry.record_metrics_heartbeat("search", &instance_id);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     registry.evaluate_metrics_health(std::time::Duration::from_secs(5));
 
     // Introduce irregular cadence to simulate heartbeat instability.
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    registry.record_metrics_heartbeat("search", "search-1");
+    registry.record_metrics_heartbeat("search", &instance_id);
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    registry.record_metrics_heartbeat("search", "search-1");
+    registry.record_metrics_heartbeat("search", &instance_id);
 
     registry.evaluate_metrics_health(std::time::Duration::from_secs(5));
 
@@ -151,7 +165,7 @@ async fn metrics_heartbeat_irregularity_marks_instance_degraded() {
         .expect("search service should exist");
     let instance = service
         .instances
-        .get("search-1")
-        .expect("search-1 should exist");
+        .get(&instance_id)
+        .expect("generated instance should exist");
     assert_eq!(instance.status, InstanceStatus::Degraded);
 }
