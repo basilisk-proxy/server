@@ -78,6 +78,14 @@ pub struct MiddlewareExecutionResult {
     pub forward_headers: HashMap<String, String>,
 }
 
+/// Context available to `use_after` middleware for inspecting proxy outcomes.
+#[derive(Clone, Debug, Default)]
+pub struct AfterMiddlewareContext {
+    pub response_status: u16,
+    pub error_message: Option<String>,
+    pub metrics: HashMap<String, f64>,
+}
+
 #[derive(Default)]
 struct MiddlewareExecutionState {
     next_called: bool,
@@ -349,7 +357,7 @@ impl LuaRuntime {
         method: &str,
         headers: &HeaderMap,
         connection_info: &RequestConnectionInfo,
-        error_message: Option<&str>,
+        context: &AfterMiddlewareContext,
     ) -> anyhow::Result<Option<MiddlewareResponse>> {
         let lua = self
             .lua
@@ -379,7 +387,7 @@ impl LuaRuntime {
                 headers,
                 &host,
                 connection_info,
-                error_message,
+                Some(context),
                 &shared_context,
             )
             .map_err(lua_to_anyhow)?;
@@ -420,7 +428,7 @@ fn execute_middleware(
     headers: &HeaderMap,
     host: &str,
     connection_info: &RequestConnectionInfo,
-    error_message: Option<&str>,
+    after_context: Option<&AfterMiddlewareContext>,
     shared_context: &Table,
 ) -> LuaResult<(Option<MiddlewareResponse>, HashMap<String, String>)> {
     let state = Arc::new(Mutex::new(MiddlewareExecutionState {
@@ -438,11 +446,11 @@ fn execute_middleware(
         headers,
         host,
         connection_info,
-        error_message,
+        after_context,
         shared_context,
         Arc::clone(&state),
     )?;
-    let res = build_res_table(lua, Arc::clone(&state))?;
+    let res = build_res_table(lua, Arc::clone(&state), after_context)?;
 
     let next_state = Arc::clone(&state);
     let next_fn = lua.create_function(move |_, ()| {
@@ -463,7 +471,7 @@ fn build_req_table(
     headers: &HeaderMap,
     host: &str,
     connection_info: &RequestConnectionInfo,
-    error_message: Option<&str>,
+    after_context: Option<&AfterMiddlewareContext>,
     shared_context: &Table,
     state: Arc<Mutex<MiddlewareExecutionState>>,
 ) -> LuaResult<Table> {
@@ -476,7 +484,7 @@ fn build_req_table(
     req.set("headers", lua_headers)?;
     req.set("host", host)?;
     set_remote_info(lua, &req, headers, connection_info)?;
-    match error_message {
+    match after_context.and_then(|ctx| ctx.error_message.as_deref()) {
         Some(err) => req.set("err", err)?,
         None => req.set("err", Value::Nil)?,
     }
@@ -567,8 +575,24 @@ fn set_remote_info(
     Ok(())
 }
 
-fn build_res_table(lua: &Lua, state: Arc<Mutex<MiddlewareExecutionState>>) -> LuaResult<Table> {
+fn build_res_table(
+    lua: &Lua,
+    state: Arc<Mutex<MiddlewareExecutionState>>,
+    after_context: Option<&AfterMiddlewareContext>,
+) -> LuaResult<Table> {
     let res = lua.create_table()?;
+
+    if let Some(context) = after_context {
+        let metrics = lua.create_table()?;
+        for (metric, value) in &context.metrics {
+            metrics.set(metric.as_str(), *value)?;
+        }
+        res.set("metrics", metrics)?;
+        res.set("status_code", context.response_status)?;
+    } else {
+        res.set("metrics", Value::Nil)?;
+        res.set("status_code", Value::Nil)?;
+    }
 
     let status_state = Arc::clone(&state);
     res.set(

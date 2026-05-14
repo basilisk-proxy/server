@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
+use tracing::{debug, info, warn};
 
 /// Active service-bus connection metadata tracked by the broker.
 pub struct ServiceBusConnection {
@@ -66,6 +67,13 @@ impl ConnectionManager {
 
     /// Adds or replaces a connection by key.
     pub fn add_connection(&self, key: String, conn: ServiceBusConnection) {
+        info!(
+            connection_key = %key,
+            service_id = %conn.service_id,
+            instance_id = %conn.instance_id,
+            authenticated = conn.authenticated,
+            "service bus connection added"
+        );
         self.connections.insert(key, conn);
     }
 
@@ -73,8 +81,10 @@ impl ConnectionManager {
     pub fn remove_connection(&self, key: &str) {
         // Never remove the reserved basilisk identity.
         if key == basilisk_connection_key() {
+            warn!(connection_key = %key, "attempted to remove reserved basilisk connection");
             return;
         }
+        info!(connection_key = %key, "service bus connection removed");
         self.connections.remove(key);
     }
 
@@ -82,16 +92,34 @@ impl ConnectionManager {
     pub fn authenticate(&self, key: &str) {
         if let Some(mut conn) = self.connections.get_mut(key) {
             conn.authenticated = true;
+            info!(
+                connection_key = %key,
+                service_id = %conn.service_id,
+                instance_id = %conn.instance_id,
+                "service bus connection authenticated"
+            );
         }
     }
 
     /// Adds topic subscriptions to a connection.
     pub fn add_subscriptions(&self, key: &str, topics: Vec<String>) {
         if let Some(mut conn) = self.connections.get_mut(key) {
+            let mut added = Vec::new();
             for topic in topics {
                 if !conn.subscriptions.contains(&topic) {
+                    added.push(topic.clone());
                     conn.subscriptions.push(topic);
                 }
+            }
+            if !added.is_empty() {
+                info!(
+                    connection_key = %key,
+                    service_id = %conn.service_id,
+                    instance_id = %conn.instance_id,
+                    topics = ?added,
+                    total_subscriptions = conn.subscriptions.len(),
+                    "service bus subscriptions added"
+                );
             }
         }
     }
@@ -99,7 +127,20 @@ impl ConnectionManager {
     /// Removes topic subscriptions from a connection.
     pub fn remove_subscriptions(&self, key: &str, topics: Vec<String>) {
         if let Some(mut conn) = self.connections.get_mut(key) {
+            let before = conn.subscriptions.len();
             conn.subscriptions.retain(|t| !topics.contains(t));
+            let removed = before.saturating_sub(conn.subscriptions.len());
+            if removed > 0 {
+                info!(
+                    connection_key = %key,
+                    service_id = %conn.service_id,
+                    instance_id = %conn.instance_id,
+                    topics = ?topics,
+                    removed_count = removed,
+                    total_subscriptions = conn.subscriptions.len(),
+                    "service bus subscriptions removed"
+                );
+            }
         }
     }
 
@@ -144,6 +185,15 @@ impl ConnectionManager {
     /// Publishes an event to matching internal and external subscribers.
     pub fn publish(&self, event: ServiceBusEventEnvelope, exclude_key: Option<&str>) -> i32 {
         let mut delivered_count = 0;
+        debug!(
+            topic = %event.topic,
+            event_id = %event.event_id,
+            source_service_id = %event.service_id,
+            source_instance_id = %event.instance_id,
+            correlation_id = event.correlation_id,
+            exclude_connection_key = ?exclude_key,
+            "service bus publish start"
+        );
 
         // Internal subscribers
         if let Some(tx) = self.internal_subscribers.get(&event.topic) {
@@ -163,9 +213,21 @@ impl ConnectionManager {
             if sub_tx.send(sub_msg).is_ok() {
                 delivered_count += 1;
             } else {
+                warn!(
+                    topic = %event.topic,
+                    subscriber_connection_key = %sub_key,
+                    "service bus publish failed to deliver to subscriber; removing connection"
+                );
                 self.remove_connection(&sub_key);
             }
         }
+        info!(
+            topic = %event.topic,
+            event_id = %event.event_id,
+            correlation_id = event.correlation_id,
+            delivered_count,
+            "service bus publish completed"
+        );
         delivered_count
     }
 
@@ -175,11 +237,13 @@ impl ConnectionManager {
         topic: String,
         tx: mpsc::UnboundedSender<ServiceBusEventEnvelope>,
     ) {
+        debug!(topic = %topic, "service bus internal subscriber added");
         self.internal_subscribers.insert(topic, tx);
     }
 
     /// Unsubscribes an internal channel from a topic.
     pub fn unsubscribe_internal(&self, topic: &str) {
+        debug!(topic = %topic, "service bus internal subscriber removed");
         self.internal_subscribers.remove(topic);
     }
 
@@ -187,12 +251,14 @@ impl ConnectionManager {
     /// events published to those topics reach the Lua runtime via `internal_rx`.
     pub fn subscribe_basilisk(&self, topics: Vec<String>) {
         let key = basilisk_connection_key();
+        debug!(topics = ?topics, "service bus basilisk subscription update");
         self.add_subscriptions(&key, topics);
     }
 
     /// Unsubscribes the reserved basilisk connection from the given topics.
     pub fn unsubscribe_basilisk(&self, topics: Vec<String>) {
         let key = basilisk_connection_key();
+        debug!(topics = ?topics, "service bus basilisk unsubscription update");
         self.remove_subscriptions(&key, topics);
     }
 
@@ -211,6 +277,13 @@ impl ConnectionManager {
 
         let request_id = format!("basilisk-{}", Uuid::now_v7());
         let reply_to_topic = format!("reply-to-{}", request_id);
+        info!(
+            request_id = %request_id,
+            target_service_id = %req.target_service_id,
+            message_type = %req.message_type,
+            timeout_ms = req.timeout_ms.unwrap_or(30_000).min(120_000),
+            "service bus forward_from_basilisk started"
+        );
 
         let (tx, mut rx) = mpsc::unbounded_channel::<ServiceBusEventEnvelope>();
         self.subscribe_internal(reply_to_topic.clone(), tx);
@@ -238,6 +311,11 @@ impl ConnectionManager {
         let delivered = self.publish(event, Some(&key));
         if delivered == 0 {
             self.unsubscribe_internal(&reply_to_topic);
+            warn!(
+                request_id = %request_id,
+                target_service_id = %req.target_service_id,
+                "service bus forward_from_basilisk failed: target has no subscribers"
+            );
             return Err(format!(
                 "No subscribers available for target service '{}'",
                 req.target_service_id
@@ -249,15 +327,30 @@ impl ConnectionManager {
         self.unsubscribe_internal(&reply_to_topic);
 
         match result {
-            Ok(Some(event)) => Ok(ServiceBusForwardResponse {
-                message_type: event.message_type,
-                payload: event.payload,
-            }),
-            Ok(None) => Err("Forward response channel closed".to_string()),
-            Err(_) => Err(format!(
-                "Timeout waiting for forward response from '{}'",
-                req.target_service_id
-            )),
+            Ok(Some(event)) => {
+                info!(
+                    request_id = %request_id,
+                    target_service_id = %req.target_service_id,
+                    response_message_type = %event.message_type,
+                    correlation_id = event.correlation_id,
+                    "service bus forward_from_basilisk completed"
+                );
+                Ok(ServiceBusForwardResponse {
+                    message_type: event.message_type,
+                    payload: event.payload,
+                })
+            }
+            Ok(None) => {
+                warn!(request_id = %request_id, target_service_id = %req.target_service_id, "service bus forward_from_basilisk failed: response channel closed");
+                Err("Forward response channel closed".to_string())
+            }
+            Err(_) => {
+                warn!(request_id = %request_id, target_service_id = %req.target_service_id, timeout_ms, "service bus forward_from_basilisk timed out");
+                Err(format!(
+                    "Timeout waiting for forward response from '{}'",
+                    req.target_service_id
+                ))
+            }
         }
     }
 }

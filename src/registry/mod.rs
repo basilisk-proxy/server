@@ -5,6 +5,7 @@ use crate::models::{InstanceStatus, RegistrationRequest, ServiceDefinition, Serv
 use chrono::Utc;
 use dashmap::DashMap;
 use std::time::Duration;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct ServiceRegistry {
@@ -48,6 +49,15 @@ impl ServiceRegistry {
 
     /// Registers a service instance and reserves declared route prefixes.
     pub async fn register(&self, request: RegistrationRequest) -> RegistrationResult {
+        info!(
+            service_id = %request.service_id,
+            fingerprint = %request.fingerprint,
+            path_prefixes = ?request.path_prefixes,
+            instance_id = %request.instance.instance_id,
+            instance_host = %request.instance.host,
+            instance_port = request.instance.port,
+            "registry registration attempt"
+        );
         let instance_id = if request.instance.instance_id.trim().is_empty() {
             Uuid::new_v4().to_string()
         } else {
@@ -58,6 +68,12 @@ impl ServiceRegistry {
         for prefix in &request.path_prefixes {
             if let Some(owner) = self.path_owners.get(prefix) {
                 if owner.value() != &request.service_id {
+                    warn!(
+                        service_id = %request.service_id,
+                        prefix = %prefix,
+                        owner_service_id = %owner.value(),
+                        "registry registration rejected due to route collision"
+                    );
                     return RegistrationResult {
                         success: false,
                         instance_id: None,
@@ -91,6 +107,12 @@ impl ServiceRegistry {
 
         // Simple fingerprint check (mocking .NET behavior)
         if service.fingerprint != request.fingerprint {
+            warn!(
+                service_id = %request.service_id,
+                expected_fingerprint = %service.fingerprint,
+                provided_fingerprint = %request.fingerprint,
+                "registry registration rejected due to fingerprint mismatch"
+            );
             return RegistrationResult {
                 success: false,
                 instance_id: None,
@@ -118,6 +140,14 @@ impl ServiceRegistry {
 
         service.instances.insert(instance_id.clone(), instance);
 
+        info!(
+            service_id = %request.service_id,
+            instance_id = %instance_id,
+            token_issued = true,
+            total_instances = service.instances.len(),
+            "registry registration succeeded"
+        );
+
         RegistrationResult {
             success: true,
             instance_id: Some(instance_id),
@@ -129,9 +159,26 @@ impl ServiceRegistry {
 
     /// Removes an instance from a service definition.
     pub async fn deregister(&self, service_id: &str, instance_id: &str) -> bool {
+        info!(service_id = %service_id, instance_id = %instance_id, "registry deregister attempt");
         if let Some(mut service) = self.services.get_mut(service_id) {
-            return service.instances.remove(instance_id).is_some();
+            let removed = service.instances.remove(instance_id).is_some();
+            if removed {
+                info!(
+                    service_id = %service_id,
+                    instance_id = %instance_id,
+                    remaining_instances = service.instances.len(),
+                    "registry deregister succeeded"
+                );
+            } else {
+                warn!(
+                    service_id = %service_id,
+                    instance_id = %instance_id,
+                    "registry deregister target instance not found"
+                );
+            }
+            return removed;
         }
+        warn!(service_id = %service_id, instance_id = %instance_id, "registry deregister target service not found");
         false
     }
 
@@ -143,6 +190,11 @@ impl ServiceRegistry {
             if let Some(instance) = service.instances.get_mut(instance_id) {
                 let now = Utc::now();
                 instance.last_heartbeat_utc = now;
+                debug!(
+                    service_id = %service_id,
+                    instance_id = %instance_id,
+                    "registry metrics heartbeat received"
+                );
 
                 let key = metrics_key(service_id, instance_id);
                 if let Some(mut hb) = self.metrics_heartbeat.get_mut(&key) {
@@ -255,16 +307,20 @@ impl ServiceRegistry {
 
     /// Binds a path prefix to a service identifier for proxy resolution.
     pub fn bind_path_prefix(&self, path_prefix: String, service_id: String) {
+        info!(path_prefix = %path_prefix, service_id = %service_id, "registry path prefix bound");
         self.path_owners.insert(path_prefix, service_id);
     }
 
     /// Resolves the best-matching service by the longest owned path prefix.
     pub fn resolve_service_by_path(&self, path: &str) -> Option<String> {
-        self.path_owners
+        let resolved = self
+            .path_owners
             .iter()
             .filter(|r| path.starts_with(r.key()))
             .max_by_key(|r| r.key().len())
-            .map(|r| r.value().clone())
+            .map(|r| r.value().clone());
+        debug!(path = %path, resolved_service_id = ?resolved, "registry path resolution");
+        resolved
     }
 
     /// Removes down instances that exceeded the configured timeout.
@@ -275,6 +331,13 @@ impl ServiceRegistry {
                 if instance.status == InstanceStatus::Down {
                     let elapsed = now.signed_duration_since(instance.last_heartbeat_utc);
                     if elapsed.to_std().unwrap_or(std::time::Duration::ZERO) > timeout {
+                        info!(
+                            service_id = %instance.service_id,
+                            instance_id = %instance.instance_id,
+                            elapsed_secs = elapsed.num_seconds(),
+                            timeout_secs = timeout.as_secs(),
+                            "registry stale instance removed"
+                        );
                         self.metrics_heartbeat
                             .remove(&metrics_key(&instance.service_id, &instance.instance_id));
                         return false;
@@ -295,6 +358,12 @@ impl ServiceRegistry {
         if let Some(mut service) = self.services.get_mut(service_id) {
             if let Some(instance) = service.instances.get_mut(instance_id) {
                 instance.status = status;
+                info!(
+                    service_id = %service_id,
+                    instance_id = %instance_id,
+                    status = ?status,
+                    "registry instance status updated"
+                );
                 if status == InstanceStatus::Up {
                     instance.last_heartbeat_utc = Utc::now();
                 }

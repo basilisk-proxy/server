@@ -297,6 +297,7 @@ end
 - `req.claimed_ip` / `req.claimed_port` (forwarded headers when present)
 - `req.has_claimed_ip_mismatch` / `req.has_claimed_port_mismatch` / `req.is_spoofed_source`
 - `req.remote` (`{ addr, ip, port }`)
+- `req.err` (set in `use_after` when request handling resulted in an error condition)
 - `req.ctx` (context dictionary for storing arbitrary values shared across middleware)
 - `req:auth(payloadTable)` - marshals Lua table to JSON and stores it in protected `X-Basilisk-Auth` header (Base64URL)
 
@@ -308,6 +309,8 @@ end
 - `res:json(jsonString)`
 - `res:end()`
 - `res:forward_headers(name, value)` - adds headers to forward to the downstream service
+- `res.metrics` (available in `use_after`; per-request timing/status metrics)
+- `res.status_code` (available in `use_after`; response status before override)
 
 `next()` continues execution to the next middleware (or proxy flow if a chain ends).
 
@@ -424,6 +427,8 @@ Because Basilisk passes the accepted socket endpoint to Lua request objects, `ne
 ```lua
 basilisk.proxy.use_after(path_rules.matches("*"), function(req, res, next)
   if req.err then
+    local took = res.metrics and res.metrics["proxy.total_ms_pre_after"] or 0
+    res:set("x-proxy-time-ms", tostring(took))
     return res:status(502):send("gateway post-check failed")
   end
   return next()
@@ -690,6 +695,8 @@ cargo test -- --nocapture
 - Runtime telemetry is available at `GET /registry/metrics/runtime`.
 - Proxy latency is aggregated by phase (`proxy.middleware`, `proxy.resolve_service`, `proxy.pick_healthy_instance`, `proxy.send_upstream_request`, `proxy.wait_upstream_response_body`, `proxy.total`).
 - TLS config fields exist in runtime config; bind/termination behavior depends on the current HTTP serving setup.
+- Tracing filter source precedence: `RUST_LOG` when set, otherwise `basilisk.observability.log_level(...)` from Lua startup config.
+- Registry and service-bus flows emit structured logs with service/instance identifiers, topics, correlation IDs, and delivery counts for audit/debug workflows.
 
 ## 13. Troubleshooting
 

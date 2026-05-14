@@ -16,7 +16,6 @@ pub const BASILISK_METRICS_DISTRIBUTION_TOPIC: &str = "basilisk.metrics.distribu
 /// Wire-level `type` values used by the service-bus protocol.
 pub mod protocol_types {
     pub const CONNECT: &str = "connect";
-    pub const AUTHENTICATE: &str = "authenticate";
     pub const SUBSCRIBE: &str = "subscribe";
     pub const UNSUBSCRIBE: &str = "unsubscribe";
     pub const PUBLISH: &str = "publish";

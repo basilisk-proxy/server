@@ -36,14 +36,26 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&connection_manager),
     )?;
 
-    // Initialize tracing
+    // Initialize tracing using RUST_LOG when present, otherwise Lua config fallback.
+    let (env_filter, filter_source) = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, "RUST_LOG"),
+        Err(_) => (
+            tracing_subscriber::EnvFilter::new(config.observability.log_level.clone()),
+            "lua_config.observability.log_level",
+        ),
+    };
+
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| config.clone().observability.log_level.into()),
-        )
+        .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    tracing::info!(
+        filter_source,
+        configured_log_level = %config.observability.log_level,
+        lua_entrypoint = %lua_entrypoint,
+        "gateway tracing initialized"
+    );
 
     // Start Service Bus TCP server
     let sb_config = config.clone();

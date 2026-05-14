@@ -46,6 +46,13 @@ pub async fn register(
     let result = registry.register(request.clone()).await;
 
     if result.success {
+        info!(
+            service_id = %request.service_id,
+            instance_id = ?result.instance_id,
+            path_prefixes = ?request.path_prefixes,
+            cache_enabled = state.config.cache.enabled,
+            "registry registration succeeded"
+        );
         if state.config.cache.enabled {
             if let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1) {
                 warn!("failed to advance registry cache version after register: {err}");
@@ -62,6 +69,12 @@ pub async fn register(
         )
             .into_response()
     } else {
+        warn!(
+            service_id = %request.service_id,
+            error_code = ?result.error_code,
+            error_message = ?result.error_message,
+            "registry registration failed"
+        );
         // ... same as before
         let status = if result.error_code.as_deref() == Some(error_codes::FINGERPRINT_INVALID) {
             StatusCode::FORBIDDEN
@@ -91,7 +104,9 @@ pub async fn deregister(
     State(state): State<Arc<AppState>>,
     Path((service_id, instance_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    info!(service_id = %service_id, instance_id = %instance_id, "registry deregister request received");
     if state.registry.deregister(&service_id, &instance_id).await {
+        info!(service_id = %service_id, instance_id = %instance_id, "registry deregister succeeded");
         if state.config.cache.enabled {
             if let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1) {
                 warn!("failed to advance registry cache version after deregister: {err}");
@@ -99,13 +114,19 @@ pub async fn deregister(
         }
         StatusCode::OK.into_response()
     } else {
+        warn!(service_id = %service_id, instance_id = %instance_id, "registry deregister target not found");
         StatusCode::NOT_FOUND.into_response()
     }
 }
 
 /// Returns all currently registered services.
 pub async fn get_all_services(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.registry.get_all_services())
+    let services = state.registry.get_all_services();
+    info!(
+        services_count = services.len(),
+        "registry services snapshot requested"
+    );
+    Json(services)
 }
 
 /// Returns a single service definition when found.
@@ -114,8 +135,10 @@ pub async fn get_service(
     Path(service_id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(service) = state.registry.get_service(&service_id) {
+        info!(service_id = %service_id, instances_count = service.instances.len(), "registry service details requested");
         Json(service).into_response()
     } else {
+        warn!(service_id = %service_id, "registry service details requested for unknown service");
         StatusCode::NOT_FOUND.into_response()
     }
 }

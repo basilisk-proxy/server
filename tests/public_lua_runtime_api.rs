@@ -1,6 +1,8 @@
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use basilisk::lua_config::{load_config_and_runtime, LuaRuntime, RequestConnectionInfo};
+use basilisk::lua_config::{
+    load_config_and_runtime, AfterMiddlewareContext, LuaRuntime, RequestConnectionInfo,
+};
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use basilisk::service_bus::contracts::{
@@ -653,7 +655,10 @@ fn use_after_can_override_response_when_error_is_present() {
         &script,
         "basilisk.proxy.use_after(path_rules.matches('*'), function(req, res, next)\n\
            if req.err then\n\
-             return res:status(502):set('x-after', 'handled'):send('after override')\n\
+             if res.metrics and res.metrics['proxy.middleware_ms'] then\n\
+               res:set('x-metrics', 'present')\n\
+             end\n\
+             return res:status(502):set('x-after', 'handled'):set('x-err', req.err):send('after override')\n\
            end\n\
            return next()\n\
          end)\n",
@@ -668,14 +673,15 @@ fn use_after_can_override_response_when_error_is_present() {
             .expect("failed to load runtime");
 
     let conn = RequestConnectionInfo::from_socket(SocketAddr::from(([127, 0, 0, 1], 8080)));
+    let mut metrics = HashMap::new();
+    metrics.insert("proxy.middleware_ms".to_string(), 1.25);
+    let context = AfterMiddlewareContext {
+        response_status: 503,
+        error_message: Some("simulated error".to_string()),
+        metrics,
+    };
     let result = runtime
-        .run_after_middlewares_with_connection(
-            "/any",
-            "GET",
-            &HeaderMap::new(),
-            &conn,
-            Some("simulated error"),
-        )
+        .run_after_middlewares_with_connection("/any", "GET", &HeaderMap::new(), &conn, &context)
         .expect("after middleware execution should succeed")
         .expect("after middleware should override response");
 
@@ -684,6 +690,14 @@ fn use_after_can_override_response_when_error_is_present() {
     assert_eq!(
         result.headers.get("x-after").map(String::as_str),
         Some("handled")
+    );
+    assert_eq!(
+        result.headers.get("x-err").map(String::as_str),
+        Some("simulated error")
+    );
+    assert_eq!(
+        result.headers.get("x-metrics").map(String::as_str),
+        Some("present")
     );
 
     let _ = fs::remove_dir_all(dir);

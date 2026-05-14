@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Starts the TCP service-bus server and serves client sessions indefinitely.
@@ -28,7 +28,8 @@ pub async fn run_server(
     info!("Service bus TCP server listening on {}", addr);
 
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, peer_addr) = listener.accept().await?;
+        info!(peer = %peer_addr, "service bus client accepted");
         let connection_manager = Arc::clone(&connection_manager);
         let registry = Arc::clone(&registry);
         let max_message_chars = config.service_bus.max_message_chars;
@@ -60,6 +61,8 @@ async fn handle_client(
     connection_health_enabled: bool,
     monitoring_enabled: bool,
 ) -> anyhow::Result<()> {
+    let peer = socket.peer_addr().ok();
+    info!(peer = ?peer, "service bus client session started");
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let (tx, mut rx) = mpsc::unbounded_channel::<ServiceBusProtocolMessage>();
@@ -79,6 +82,7 @@ async fn handle_client(
                 }
 
                 if line.len() > max_message_chars {
+                    warn!(peer = ?peer, length = line.len(), max_message_chars, "service bus inbound message exceeded maximum size");
                     let _ = tx.send(ServiceBusProtocolMessage {
                         r#type: protocol_types::ERROR.to_string(),
                         error_code: Some("MESSAGE_TOO_LARGE".to_string()),
@@ -91,6 +95,7 @@ async fn handle_client(
                 let msg: ServiceBusProtocolMessage = match serde_json::from_str(&line) {
                     Ok(m) => m,
                     Err(_) => {
+                        warn!(peer = ?peer, "service bus inbound payload is invalid JSON");
                         let _ = tx.send(ServiceBusProtocolMessage {
                             r#type: protocol_types::ERROR.to_string(),
                             error_code: Some("INVALID_JSON".to_string()),
@@ -105,6 +110,7 @@ async fn handle_client(
 
                 match msg.r#type.as_str() {
                     protocol_types::CONNECT => {
+                        info!(peer = ?peer, "service bus connect message received");
                         if connection_key.is_some() {
                             let _ = tx.send(ServiceBusProtocolMessage {
                                 r#type: protocol_types::ERROR.to_string(),
@@ -117,6 +123,7 @@ async fn handle_client(
                         {
                             // Reject attempts to impersonate the reserved basilisk identity.
                             if sid == BASILISK_SERVICE_ID || iid == BASILISK_INSTANCE_ID {
+                                warn!(peer = ?peer, service_id = %sid, instance_id = %iid, "service bus reserved identity connect attempt rejected");
                                 let _ = tx.send(ServiceBusProtocolMessage {
                                     r#type: protocol_types::ERROR.to_string(),
                                     error_code: Some("RESERVED_IDENTITY".to_string()),
@@ -127,6 +134,7 @@ async fn handle_client(
                                     ..Default::default()
                                 });
                             } else if !registry.validate_instance_token(&sid, &iid, &token) {
+                                warn!(peer = ?peer, service_id = %sid, instance_id = %iid, "service bus connect authentication failed");
                                 let _ = tx.send(ServiceBusProtocolMessage {
                                     r#type: protocol_types::ERROR.to_string(),
                                     error_code: Some("AUTH_FAILED".to_string()),
@@ -136,6 +144,15 @@ async fn handle_client(
                             } else {
                                 let key = format!("{}:{}", sid, iid);
                                 connection_key = Some(key.clone());
+                                info!(
+                                    peer = ?peer,
+                                    connection_key = %key,
+                                    service_id = %sid,
+                                    instance_id = %iid,
+                                    connection_health_enabled,
+                                    monitoring_enabled,
+                                    "service bus client connected"
+                                );
                                 connection_manager.add_connection(
                                     key.clone(),
                                     ServiceBusConnection {
@@ -174,51 +191,11 @@ async fn handle_client(
                             });
                         }
                     }
-                    protocol_types::AUTHENTICATE => {
-                        if let Some(key) = &connection_key {
-                            if connection_manager.is_authenticated(key) {
-                                let _ = tx.send(ServiceBusProtocolMessage {
-                                    r#type: protocol_types::ACK.to_string(),
-                                    message: Some("Already authenticated".to_string()),
-                                    ..Default::default()
-                                });
-                            } else if let Some(token) = msg.token {
-                                if let Some((sid, iid)) = connection_manager.get_connection_info(key) {
-                                    if registry.validate_instance_token(&sid, &iid, &token) {
-                                        connection_manager.authenticate(key);
-                                        if connection_health_enabled {
-                                            registry
-                                                .update_instance_status(&sid, &iid, InstanceStatus::Up)
-                                                .await;
-                                        }
-                                        let _ = tx.send(ServiceBusProtocolMessage {
-                                            r#type: protocol_types::ACK.to_string(),
-                                            message: Some("Authenticated".to_string()),
-                                            ..Default::default()
-                                        });
-                                    } else {
-                                        let _ = tx.send(ServiceBusProtocolMessage {
-                                            r#type: protocol_types::ERROR.to_string(),
-                                            error_code: Some("AUTH_FAILED".to_string()),
-                                            message: Some("Authentication failed".to_string()),
-                                            ..Default::default()
-                                        });
-                                    }
-                                }
-                            } else {
-                                let _ = tx.send(ServiceBusProtocolMessage {
-                                    r#type: protocol_types::ERROR.to_string(),
-                                    error_code: Some("AUTH_REQUIRED".to_string()),
-                                    message: Some("Authentication token is required".to_string()),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
                     protocol_types::SUBSCRIBE => {
                         if let Some(key) = &connection_key {
                             if connection_manager.is_authenticated(key) {
                                 if let Some(topics) = msg.topics {
+                                    info!(peer = ?peer, connection_key = %key, topics = ?topics, "service bus subscribe request accepted");
                                     connection_manager.add_subscriptions(key, topics);
                                     let _ = tx.send(ServiceBusProtocolMessage {
                                         r#type: protocol_types::ACK.to_string(),
@@ -241,6 +218,7 @@ async fn handle_client(
                             if connection_manager.is_authenticated(key) {
                                 if let Some(mut event) = msg.event {
                                     if event.topic.is_empty() {
+                                        warn!(peer = ?peer, connection_key = %key, "service bus publish rejected: topic required");
                                         let _ = tx.send(ServiceBusProtocolMessage {
                                             r#type: protocol_types::ERROR.to_string(),
                                             error_code: Some("TOPIC_REQUIRED".to_string()),
@@ -259,6 +237,17 @@ async fn handle_client(
                                         };
 
                                         let delivered_count = connection_manager.publish(event.clone(), Some(key));
+                                        info!(
+                                            peer = ?peer,
+                                            connection_key = %key,
+                                            topic = %event.topic,
+                                            event_id = %event.event_id,
+                                            source_service_id = %event.service_id,
+                                            source_instance_id = %event.instance_id,
+                                            correlation_id = event.correlation_id,
+                                            delivered_count,
+                                            "service bus publish handled"
+                                        );
 
                                         let _ = tx.send(ServiceBusProtocolMessage {
                                             r#type: protocol_types::ACK.to_string(),
@@ -278,6 +267,16 @@ async fn handle_client(
                     protocol_types::FORWARD => {
                         if let Some(key) = &connection_key {
                             if connection_manager.is_authenticated(key) {
+                                if let Some(request) = &msg.forward_request {
+                                    info!(
+                                        peer = ?peer,
+                                        connection_key = %key,
+                                        target_service_id = %request.target_service_id,
+                                        message_type = %request.message_type,
+                                        timeout_ms = request.timeout_ms.unwrap_or(30_000).min(120_000),
+                                        "service bus forward request accepted"
+                                    );
+                                }
                                 let response = handle_forward_request(
                                     Arc::clone(&connection_manager),
                                     key,
@@ -299,6 +298,7 @@ async fn handle_client(
             }
             msg = rx.recv() => {
                 if let Some(msg) = msg {
+                    debug!(peer = ?peer, message_type = %msg.r#type, "service bus outbound message flushed");
                     let mut json = serde_json::to_string(&msg)?;
                     json.push('\n');
                     writer.write_all(json.as_bytes()).await?;
@@ -313,6 +313,7 @@ async fn handle_client(
     if let Some(key) = connection_key {
         if connection_health_enabled {
             if let Some((sid, iid)) = connection_manager.get_connection_info(&key) {
+                info!(peer = ?peer, connection_key = %key, service_id = %sid, instance_id = %iid, "service bus client disconnected; marking instance down");
                 registry
                     .update_instance_status(&sid, &iid, InstanceStatus::Down)
                     .await;
@@ -320,6 +321,7 @@ async fn handle_client(
         }
         connection_manager.remove_connection(&key);
     }
+    info!(peer = ?peer, "service bus client session ended");
     Ok(())
 }
 
@@ -329,6 +331,7 @@ async fn handle_forward_request(
     key: &str,
     forward_request: Option<ServiceBusForwardRequest>,
 ) -> ServiceBusProtocolMessage {
+    debug!(connection_key = %key, "service bus handling forward request");
     let forward_request = match forward_request {
         Some(req) => req,
         None => {
@@ -364,6 +367,13 @@ async fn handle_forward_request(
 
     let request_id = format!("basilisk-{}", Uuid::now_v7());
     let reply_to_topic = format!("reply-to-{}", request_id);
+    info!(
+        connection_key = %key,
+        request_id = %request_id,
+        target_service_id = %forward_request.target_service_id,
+        message_type = %forward_request.message_type,
+        "service bus forward relay started"
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ServiceBusEventEnvelope>();
     connection_manager.subscribe_internal(reply_to_topic.clone(), tx);
@@ -390,6 +400,7 @@ async fn handle_forward_request(
     let delivered = connection_manager.publish(event, Some(key));
     if delivered == 0 {
         connection_manager.unsubscribe_internal(&reply_to_topic);
+        warn!(connection_key = %key, request_id = %request_id, target_service_id = %forward_request.target_service_id, "service bus forward relay failed: no target subscribers");
         return ServiceBusProtocolMessage {
             r#type: protocol_types::ERROR.to_string(),
             error_code: Some("TARGET_NOT_AVAILABLE".to_string()),
@@ -411,6 +422,14 @@ async fn handle_forward_request(
                 );
             }
 
+            info!(
+                connection_key = %key,
+                request_id = %request_id,
+                target_service_id = %forward_request.target_service_id,
+                response_message_type = %event.message_type,
+                response_correlation_id = event.correlation_id,
+                "service bus forward relay completed"
+            );
             ServiceBusProtocolMessage {
                 r#type: protocol_types::FORWARD_RESPONSE.to_string(),
                 forward_response: Some(ServiceBusForwardResponse {
@@ -421,17 +440,23 @@ async fn handle_forward_request(
                 ..Default::default()
             }
         }
-        Ok(None) => ServiceBusProtocolMessage {
-            r#type: protocol_types::ERROR.to_string(),
-            error_code: Some("FORWARD_CHANNEL_CLOSED".to_string()),
-            message: Some("Forward response channel closed".to_string()),
-            ..Default::default()
-        },
-        Err(_) => ServiceBusProtocolMessage {
-            r#type: protocol_types::ERROR.to_string(),
-            error_code: Some("FORWARD_TIMEOUT".to_string()),
-            message: Some("Timeout waiting for forward response".to_string()),
-            ..Default::default()
-        },
+        Ok(None) => {
+            warn!(connection_key = %key, request_id = %request_id, "service bus forward relay failed: response channel closed");
+            ServiceBusProtocolMessage {
+                r#type: protocol_types::ERROR.to_string(),
+                error_code: Some("FORWARD_CHANNEL_CLOSED".to_string()),
+                message: Some("Forward response channel closed".to_string()),
+                ..Default::default()
+            }
+        }
+        Err(_) => {
+            warn!(connection_key = %key, request_id = %request_id, timeout_ms, "service bus forward relay timed out");
+            ServiceBusProtocolMessage {
+                r#type: protocol_types::ERROR.to_string(),
+                error_code: Some("FORWARD_TIMEOUT".to_string()),
+                message: Some("Timeout waiting for forward response".to_string()),
+                ..Default::default()
+            }
+        }
     }
 }
