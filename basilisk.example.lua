@@ -45,7 +45,7 @@ basilisk.proxy.use(function(req, _, next)
 end)
 
 -- Example: custom middleware mounted on selected path prefix
-basilisk.proxy.use("/api/private", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/api/private"), function(req, res, next)
   if not req.ctx["auth_token"] then
     return res:status(401)
       :set("www-authenticate", "Bearer")
@@ -54,5 +54,13 @@ basilisk.proxy.use("/api/private", function(req, res, next)
 
   -- Forward authentication header to downstream service
   res:forward_headers("Authorization", req.ctx["auth_token"])
+  return next()
+end)
+
+-- Example: custom error handling middleware
+basilisk.proxy.use_after(path_rules.matches("*"), function(req, res, next)
+  if req.err then
+    return res:status(500):send("Internal Server Error")
+  end
   return next()
 end)

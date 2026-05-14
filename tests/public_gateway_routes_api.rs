@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -10,6 +10,7 @@ use basilisk::models::{AuthInfo, InstanceInfo, RegistrationRequest};
 use basilisk::observability::RuntimeTelemetry;
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::ConnectionManager;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 fn test_state() -> Arc<AppState> {
@@ -47,8 +48,14 @@ fn registration_request(service_id: &str, instance_id: &str) -> RegistrationRequ
 async fn registry_routes_register_query_and_deregister_instances() {
     let state = test_state();
 
+    let socket_addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        8080,
+    );
+
     let register_resp = routes::register(
         State(Arc::clone(&state)),
+        ConnectInfo(socket_addr),
         Json(registration_request("orders", "orders-1")),
     )
     .await
@@ -78,9 +85,14 @@ async fn registry_routes_register_query_and_deregister_instances() {
 async fn register_route_rejects_invalid_token() {
     let state = test_state();
     let mut request = registration_request("payments", "payments-1");
+    let socket_addr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        8080,
+    );
+
     request.auth.token = "wrong-token".to_string();
 
-    let response = routes::register(State(state), Json(request))
+    let response = routes::register(State(state), ConnectInfo(socket_addr), Json(request))
         .await
         .into_response();
 

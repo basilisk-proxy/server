@@ -26,7 +26,7 @@ async fn proxy_handler_applies_lua_middleware_before_route_resolution() {
     let script = dir.join("basilisk.lua");
     fs::write(
         &script,
-        "basilisk.proxy.use('/blocked', function(req, res, next)\n\
+        "basilisk.proxy.use(path_rules.has_prefix('/blocked'), function(req, res, next)\n\
          return res:status(418):send('teapot')\n\
          end)\n",
     )

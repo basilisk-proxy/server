@@ -1,5 +1,6 @@
 use crate::cache::GatewayCache;
 use crate::config::GatewayConfig;
+use crate::helper::set_headers;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
 use crate::service_bus::contracts::{
@@ -11,6 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use mlua::{Function, Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value};
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -19,7 +21,8 @@ use uuid::Uuid;
 /// Hosts the embedded Lua VM and registered HTTP middlewares.
 pub struct LuaRuntime {
     lua: Mutex<Lua>,
-    middlewares: Mutex<Vec<MiddlewareMount>>,
+    before_middlewares: Mutex<Vec<MiddlewareMount>>,
+    after_middlewares: Mutex<Vec<MiddlewareMount>>,
     /// Registered service-bus event handlers: topic → handler key.
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
     /// Channel sender used by the background bus-dispatch task to deliver events
@@ -29,8 +32,37 @@ pub struct LuaRuntime {
 
 /// Internal middleware registration entry.
 struct MiddlewareMount {
-    path_prefix: Option<String>,
+    matcher: MiddlewareMatcher,
     handler_key: RegistryKey,
+}
+
+enum MiddlewareMatcher {
+    Any,
+    Predicate(RegistryKey),
+}
+
+/// Canonical connection details captured from the accepted TCP socket.
+#[derive(Clone, Debug)]
+pub struct RequestConnectionInfo {
+    pub remote_addr: SocketAddr,
+}
+
+impl RequestConnectionInfo {
+    pub fn from_socket(remote_addr: SocketAddr) -> Self {
+        Self { remote_addr }
+    }
+
+    fn remote_addr_string(&self) -> String {
+        self.remote_addr.to_string()
+    }
+
+    fn remote_ip_string(&self) -> String {
+        self.remote_addr.ip().to_string()
+    }
+
+    fn remote_port(&self) -> u16 {
+        self.remote_addr.port()
+    }
 }
 
 /// HTTP response produced by a Lua middleware that short-circuits the pipeline.
@@ -83,7 +115,8 @@ pub fn load_config_and_runtime(
         .set("path", modules_path.to_string_lossy().as_ref())
         .map_err(lua_to_anyhow)?;
 
-    let middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
+    let before_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
+    let after_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
     let config_state = Arc::new(Mutex::new(GatewayConfig::default()));
     let cache = Arc::new(GatewayCache::new("memory")?);
     let event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>> =
@@ -95,7 +128,8 @@ pub fn load_config_and_runtime(
         Arc::clone(&cache),
         Arc::clone(&registry),
         Arc::clone(&connection_manager),
-        Arc::clone(&middleware_mounts),
+        Arc::clone(&before_middleware_mounts),
+        Arc::clone(&after_middleware_mounts),
         Arc::clone(&event_handlers),
     )
     .map_err(lua_to_anyhow)?;
@@ -131,8 +165,15 @@ pub fn load_config_and_runtime(
 
     let runtime = Arc::new(LuaRuntime {
         lua: Mutex::new(lua),
-        middlewares: Mutex::new(
-            middleware_mounts
+        before_middlewares: Mutex::new(
+            before_middleware_mounts
+                .lock()
+                .map_err(|_| anyhow!("Lua middleware lock poisoned"))?
+                .drain(..)
+                .collect(),
+        ),
+        after_middlewares: Mutex::new(
+            after_middleware_mounts
                 .lock()
                 .map_err(|_| anyhow!("Lua middleware lock poisoned"))?
                 .drain(..)
@@ -176,7 +217,8 @@ impl LuaRuntime {
         let (event_dispatch_tx, _) = mpsc::unbounded_channel::<ServiceBusEventEnvelope>();
         Arc::new(Self {
             lua: Mutex::new(Lua::new()),
-            middlewares: Mutex::new(Vec::new()),
+            before_middlewares: Mutex::new(Vec::new()),
+            after_middlewares: Mutex::new(Vec::new()),
             event_handlers: Arc::new(Mutex::new(HashMap::new())),
             event_dispatch_tx,
         })
@@ -238,26 +280,50 @@ impl LuaRuntime {
         method: &str,
         headers: &HeaderMap,
     ) -> anyhow::Result<MiddlewareExecutionResult> {
+        let fallback_info = RequestConnectionInfo::from_socket(SocketAddr::from(([0, 0, 0, 0], 0)));
+        self.run_middlewares_with_connection(path, method, headers, &fallback_info)
+    }
+
+    /// Runs registered Lua middlewares for a request using real remote connection data.
+    pub fn run_middlewares_with_connection(
+        &self,
+        path: &str,
+        method: &str,
+        headers: &HeaderMap,
+        connection_info: &RequestConnectionInfo,
+    ) -> anyhow::Result<MiddlewareExecutionResult> {
         let lua = self
             .lua
             .lock()
             .map_err(|_| anyhow!("Lua runtime lock poisoned"))?;
         let middleware_mounts = self
-            .middlewares
+            .before_middlewares
             .lock()
             .map_err(|_| anyhow!("Lua middleware lock poisoned"))?;
 
         let mut accumulated_forward_headers = HashMap::new();
         let shared_context = lua.create_table().map_err(lua_to_anyhow)?;
+        let host = extract_host(headers);
 
         for mount in middleware_mounts.iter() {
-            if !middleware_applies(mount, path) {
+            if !middleware_applies(&lua, mount, path, method, headers, &host, connection_info)
+                .map_err(lua_to_anyhow)?
+            {
                 continue;
             }
 
-            let (response, forward_headers) =
-                execute_middleware(&lua, mount, path, method, headers, &shared_context)
-                    .map_err(lua_to_anyhow)?;
+            let (response, forward_headers) = execute_middleware(
+                &lua,
+                mount,
+                path,
+                method,
+                headers,
+                &host,
+                connection_info,
+                None,
+                &shared_context,
+            )
+            .map_err(lua_to_anyhow)?;
 
             // Accumulate forward headers
             accumulated_forward_headers.extend(forward_headers);
@@ -275,12 +341,74 @@ impl LuaRuntime {
             forward_headers: accumulated_forward_headers,
         })
     }
+
+    /// Runs registered post-proxy middlewares after routing/forwarding completes.
+    pub fn run_after_middlewares_with_connection(
+        &self,
+        path: &str,
+        method: &str,
+        headers: &HeaderMap,
+        connection_info: &RequestConnectionInfo,
+        error_message: Option<&str>,
+    ) -> anyhow::Result<Option<MiddlewareResponse>> {
+        let lua = self
+            .lua
+            .lock()
+            .map_err(|_| anyhow!("Lua runtime lock poisoned"))?;
+        let middleware_mounts = self
+            .after_middlewares
+            .lock()
+            .map_err(|_| anyhow!("Lua middleware lock poisoned"))?;
+
+        let host = extract_host(headers);
+        let shared_context = lua.create_table().map_err(lua_to_anyhow)?;
+        let mut current_response = None;
+
+        for mount in middleware_mounts.iter() {
+            if !middleware_applies(&lua, mount, path, method, headers, &host, connection_info)
+                .map_err(lua_to_anyhow)?
+            {
+                continue;
+            }
+
+            let (response, _) = execute_middleware(
+                &lua,
+                mount,
+                path,
+                method,
+                headers,
+                &host,
+                connection_info,
+                error_message,
+                &shared_context,
+            )
+            .map_err(lua_to_anyhow)?;
+
+            if response.is_some() {
+                current_response = response;
+            }
+        }
+
+        Ok(current_response)
+    }
 }
 
-fn middleware_applies(mount: &MiddlewareMount, path: &str) -> bool {
-    match &mount.path_prefix {
-        Some(prefix) => path.starts_with(prefix),
-        None => true,
+fn middleware_applies(
+    lua: &Lua,
+    mount: &MiddlewareMount,
+    path: &str,
+    method: &str,
+    headers: &HeaderMap,
+    host: &str,
+    connection_info: &RequestConnectionInfo,
+) -> LuaResult<bool> {
+    match &mount.matcher {
+        MiddlewareMatcher::Any => Ok(true),
+        MiddlewareMatcher::Predicate(rule_key) => {
+            let rule: Function = lua.registry_value(rule_key)?;
+            let req = build_matcher_req_table(lua, path, method, headers, host, connection_info)?;
+            rule.call::<bool>(req)
+        }
     }
 }
 
@@ -290,6 +418,9 @@ fn execute_middleware(
     path: &str,
     method: &str,
     headers: &HeaderMap,
+    host: &str,
+    connection_info: &RequestConnectionInfo,
+    error_message: Option<&str>,
     shared_context: &Table,
 ) -> LuaResult<(Option<MiddlewareResponse>, HashMap<String, String>)> {
     let state = Arc::new(Mutex::new(MiddlewareExecutionState {
@@ -305,6 +436,9 @@ fn execute_middleware(
         path,
         method,
         headers,
+        host,
+        connection_info,
+        error_message,
         shared_context,
         Arc::clone(&state),
     )?;
@@ -327,6 +461,9 @@ fn build_req_table(
     path: &str,
     method: &str,
     headers: &HeaderMap,
+    host: &str,
+    connection_info: &RequestConnectionInfo,
+    error_message: Option<&str>,
     shared_context: &Table,
     state: Arc<Mutex<MiddlewareExecutionState>>,
 ) -> LuaResult<Table> {
@@ -335,12 +472,14 @@ fn build_req_table(
     req.set("method", method)?;
 
     let lua_headers = lua.create_table()?;
-    for (key, value) in headers.iter() {
-        if let Ok(value) = value.to_str() {
-            lua_headers.set(key.as_str(), value)?;
-        }
-    }
+    set_headers(headers, &lua_headers)?;
     req.set("headers", lua_headers)?;
+    req.set("host", host)?;
+    set_remote_info(lua, &req, headers, connection_info)?;
+    match error_message {
+        Some(err) => req.set("err", err)?,
+        None => req.set("err", Value::Nil)?,
+    }
 
     // Use the shared context dictionary (passed from middleware lifecycle)
     req.set("ctx", shared_context.clone())?;
@@ -362,6 +501,70 @@ fn build_req_table(
     )?;
 
     Ok(req)
+}
+
+fn build_matcher_req_table(
+    lua: &Lua,
+    path: &str,
+    method: &str,
+    headers: &HeaderMap,
+    host: &str,
+    connection_info: &RequestConnectionInfo,
+) -> LuaResult<Table> {
+    let req = lua.create_table()?;
+    req.set("path", path)?;
+    req.set("method", method)?;
+    req.set("host", host)?;
+
+    let lua_headers = lua.create_table()?;
+    set_headers(headers, &lua_headers)?;
+    req.set("headers", lua_headers)?;
+
+    set_remote_info(lua, &req, headers, connection_info)?;
+    Ok(req)
+}
+
+fn set_remote_info(
+    lua: &Lua,
+    req: &Table,
+    headers: &HeaderMap,
+    connection_info: &RequestConnectionInfo,
+) -> LuaResult<()> {
+    req.set("remote_addr", connection_info.remote_addr_string())?;
+    req.set("remote_ip", connection_info.remote_ip_string())?;
+    req.set("remote_port", connection_info.remote_port())?;
+
+    let claimed_ip = header_value(headers, "x-forwarded-for")
+        .and_then(parse_first_forwarded_for_ip)
+        .unwrap_or_default();
+    let claimed_port = header_value(headers, "x-forwarded-port")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    req.set("claimed_ip", claimed_ip.clone())?;
+    req.set("claimed_port", claimed_port)?;
+    req.set(
+        "has_claimed_ip_mismatch",
+        !claimed_ip.is_empty() && claimed_ip != connection_info.remote_ip_string(),
+    )?;
+    req.set(
+        "has_claimed_port_mismatch",
+        claimed_port != 0 && claimed_port != connection_info.remote_port(),
+    )?;
+    req.set("is_spoofed_source", {
+        let ip_mismatch =
+            !claimed_ip.is_empty() && claimed_ip != connection_info.remote_ip_string();
+        let port_mismatch = claimed_port != 0 && claimed_port != connection_info.remote_port();
+        ip_mismatch || port_mismatch
+    })?;
+
+    let remote = lua.create_table()?;
+    remote.set("addr", connection_info.remote_addr_string())?;
+    remote.set("ip", connection_info.remote_ip_string())?;
+    remote.set("port", connection_info.remote_port())?;
+    req.set("remote", remote)?;
+
+    Ok(())
 }
 
 fn build_res_table(lua: &Lua, state: Arc<Mutex<MiddlewareExecutionState>>) -> LuaResult<Table> {
@@ -487,7 +690,8 @@ fn register_primitives(
     cache: Arc<GatewayCache>,
     registry: Arc<ServiceRegistry>,
     connection_manager: Arc<ConnectionManager>,
-    middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
 ) -> LuaResult<()> {
     let basilisk = lua.create_table()?;
@@ -505,9 +709,14 @@ fn register_primitives(
         make_service_bus_api(lua, Arc::clone(&config), connection_manager, event_handlers)?,
     )?;
     basilisk.set("registry", make_registry_api(lua, registry)?)?;
-    basilisk.set("proxy", make_proxy_api(lua, middleware_mounts)?)?;
+    basilisk.set(
+        "proxy",
+        make_proxy_api(lua, before_middleware_mounts, after_middleware_mounts)?,
+    )?;
 
     lua.globals().set("basilisk", basilisk)?;
+    lua.globals().set("path_rules", make_path_rules_api(lua)?)?;
+    lua.globals().set("net_rules", make_net_rules_api(lua)?)?;
     Ok(())
 }
 
@@ -1269,24 +1478,47 @@ fn make_registry_api(lua: &Lua, registry: Arc<ServiceRegistry>) -> LuaResult<Tab
 
 fn make_proxy_api(
     lua: &Lua,
-    middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
 ) -> LuaResult<Table> {
     let table = lua.create_table()?;
 
-    let mounts = Arc::clone(&middleware_mounts);
+    let mounts = Arc::clone(&before_middleware_mounts);
     table.set(
         "use",
         lua.create_function(move |lua, args: MultiValue| {
-            let (path_prefixes, handler) = parse_middleware_use_args(args)?;
+            let (matchers, handler) = parse_middleware_use_args(lua, args)?;
             let handler_key = lua.create_registry_value(handler)?;
             let mut guard = mounts
                 .lock()
                 .map_err(|_| mlua::Error::external("Lua middleware lock poisoned"))?;
 
-            // Register middleware for each path prefix
-            for path_prefix in path_prefixes {
+            // Register middleware for each matcher variant.
+            for matcher in matchers {
                 guard.push(MiddlewareMount {
-                    path_prefix,
+                    matcher,
+                    handler_key: lua
+                        .create_registry_value(lua.registry_value::<Function>(&handler_key)?)?,
+                });
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let mounts = Arc::clone(&after_middleware_mounts);
+    table.set(
+        "use_after",
+        lua.create_function(move |lua, args: MultiValue| {
+            let (matchers, handler) = parse_middleware_use_args(lua, args)?;
+            let handler_key = lua.create_registry_value(handler)?;
+            let mut guard = mounts
+                .lock()
+                .map_err(|_| mlua::Error::external("Lua middleware lock poisoned"))?;
+
+            // Register middleware for each matcher variant.
+            for matcher in matchers {
+                guard.push(MiddlewareMount {
+                    matcher,
                     handler_key: lua
                         .create_registry_value(lua.registry_value::<Function>(&handler_key)?)?,
                 });
@@ -1298,56 +1530,347 @@ fn make_proxy_api(
     Ok(table)
 }
 
-fn parse_middleware_use_args(args: MultiValue) -> LuaResult<(Vec<Option<String>>, Function)> {
+fn parse_middleware_use_args(
+    lua: &Lua,
+    args: MultiValue,
+) -> LuaResult<(Vec<MiddlewareMatcher>, Function)> {
     let values: Vec<Value> = args.into_vec();
     match values.as_slice() {
         [Value::Function(handler)] => {
             // Global middleware: use(handler)
-            Ok((vec![None], handler.clone()))
+            Ok((vec![MiddlewareMatcher::Any], handler.clone()))
         }
-        [Value::String(prefix), Value::Function(handler)] => {
-            // Single path middleware: use(pathPrefix, handler)
+        [Value::Function(rule), Value::Function(handler)] => {
+            // Rule middleware: use(ruleFn, handler)
+            let rule_key = lua.create_registry_value(rule.clone())?;
             Ok((
-                vec![Some(prefix.to_str()?.to_string())],
+                vec![MiddlewareMatcher::Predicate(rule_key)],
                 handler.clone(),
             ))
         }
         [Value::Table(table_val), Value::Function(handler)] => {
-            // Multi-path middleware: use({pathPrefix1, pathPrefix2, ...}, handler)
-            let path_prefixes = parse_path_prefix_array(table_val)?;
-            Ok((path_prefixes, handler.clone()))
+            // Multi-rule middleware: use({ruleFn, ...}, handler)
+            let matchers = parse_matcher_array(lua, table_val)?;
+            Ok((matchers, handler.clone()))
         }
         _ => Err(mlua::Error::external(
-            "proxy.use expects use(handler), use(pathPrefix, handler), or use({pathPrefix, ...}, handler)",
+            "proxy.use expects use(handler), use(ruleFn, handler), or use({ruleFn, ...}, handler)",
         )),
     }
 }
 
-fn parse_path_prefix_array(table: &Table) -> LuaResult<Vec<Option<String>>> {
-    let mut prefixes = Vec::new();
+fn parse_matcher_array(lua: &Lua, table: &Table) -> LuaResult<Vec<MiddlewareMatcher>> {
+    let mut matchers = Vec::new();
     let mut index = 1;
 
     loop {
         let value: Value = table.raw_get(index)?;
         match value {
-            Value::String(s) => {
-                prefixes.push(Some(s.to_str()?.to_string()));
+            Value::Function(rule) => {
+                let rule_key = lua.create_registry_value(rule.clone())?;
+                matchers.push(MiddlewareMatcher::Predicate(rule_key));
                 index += 1;
             }
             Value::Nil => break,
             _ => {
                 return Err(mlua::Error::external(
-                    "path prefix array must contain only strings",
+                    "matcher array must contain only rule functions",
                 ))
             }
         }
     }
 
-    if prefixes.is_empty() {
-        return Err(mlua::Error::external("path prefix array cannot be empty"));
+    if matchers.is_empty() {
+        return Err(mlua::Error::external("matcher array cannot be empty"));
     }
 
-    Ok(prefixes)
+    Ok(matchers)
+}
+
+fn make_path_rules_api(lua: &Lua) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+
+    table.set(
+        "exact",
+        lua.create_function(move |lua, expected: String| {
+            lua.create_function(move |_, req: Table| Ok(req.get::<String>("path")? == expected))
+        })?,
+    )?;
+
+    table.set(
+        "matches",
+        lua.create_function(move |lua, pattern: String| {
+            lua.create_function(move |_, req: Table| {
+                let path = req.get::<String>("path")?;
+                Ok(path_matches_pattern(&path, &pattern))
+            })
+        })?,
+    )?;
+
+    table.set(
+        "has_prefix",
+        lua.create_function(move |lua, prefix: String| {
+            lua.create_function(move |_, req: Table| {
+                let path = req.get::<String>("path")?;
+                Ok(path.starts_with(&prefix))
+            })
+        })?,
+    )?;
+
+    table.set(
+        "has_prefix_in",
+        lua.create_function(move |lua, prefixes: Table| {
+            let mut values = Vec::new();
+            let mut index = 1;
+            loop {
+                let value: Value = prefixes.raw_get(index)?;
+                match value {
+                    Value::String(prefix) => {
+                        values.push(prefix.to_str()?.to_string());
+                        index += 1;
+                    }
+                    Value::Nil => break,
+                    _ => {
+                        return Err(mlua::Error::external(
+                            "path_rules.has_prefix_in expects an array of prefixes",
+                        ))
+                    }
+                }
+            }
+            if values.is_empty() {
+                return Err(mlua::Error::external(
+                    "path_rules.has_prefix_in requires at least one prefix",
+                ));
+            }
+            lua.create_function(move |_, req: Table| {
+                let path = req.get::<String>("path")?;
+                Ok(values.iter().any(|prefix| path.starts_with(prefix)))
+            })
+        })?,
+    )?;
+
+    table.set(
+        "from_host",
+        lua.create_function(move |lua, expected_host: String| {
+            let expected = normalize_host_value(&expected_host);
+            lua.create_function(move |_, req: Table| {
+                let host = req.get::<String>("host")?;
+                Ok(normalize_host_value(&host) == expected)
+            })
+        })?,
+    )?;
+
+    table.set(
+        "is_any_of",
+        lua.create_function(move |lua, rules: Table| {
+            let mut keys = Vec::new();
+            let mut index = 1;
+            loop {
+                let value: Value = rules.raw_get(index)?;
+                match value {
+                    Value::Function(rule) => {
+                        keys.push(lua.create_registry_value(rule)?);
+                        index += 1;
+                    }
+                    Value::Nil => break,
+                    _ => {
+                        return Err(mlua::Error::external(
+                            "path_rules.is_any_of expects an array of rule functions",
+                        ))
+                    }
+                }
+            }
+            if keys.is_empty() {
+                return Err(mlua::Error::external(
+                    "path_rules.is_any_of requires at least one rule function",
+                ));
+            }
+            lua.create_function(move |lua, req: Table| {
+                for key in &keys {
+                    let rule: Function = lua.registry_value(key)?;
+                    if rule.call::<bool>(req.clone())? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+        })?,
+    )?;
+
+    Ok(table)
+}
+
+fn make_net_rules_api(lua: &Lua) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+
+    table.set(
+        "is_ip",
+        lua.create_function(move |lua, expected_ip: String| {
+            let normalized = normalize_ip_string(&expected_ip);
+            lua.create_function(move |_, req: Table| {
+                let remote_ip = req.get::<String>("remote_ip")?;
+                Ok(normalize_ip_string(&remote_ip) == normalized)
+            })
+        })?,
+    )?;
+
+    table.set(
+        "is_ip_in",
+        lua.create_function(move |lua, ips: Table| {
+            let mut normalized_set = HashSet::new();
+            let mut index = 1;
+            loop {
+                let value: Value = ips.raw_get(index)?;
+                match value {
+                    Value::String(ip) => {
+                        normalized_set.insert(normalize_ip_string(ip.to_str()?.as_ref()));
+                        index += 1;
+                    }
+                    Value::Nil => break,
+                    _ => {
+                        return Err(mlua::Error::external(
+                            "net_rules.is_ip_in expects an array of IP strings",
+                        ))
+                    }
+                }
+            }
+            if normalized_set.is_empty() {
+                return Err(mlua::Error::external(
+                    "net_rules.is_ip_in requires at least one IP",
+                ));
+            }
+            lua.create_function(move |_, req: Table| {
+                let remote_ip = req.get::<String>("remote_ip")?;
+                Ok(normalized_set.contains(&normalize_ip_string(&remote_ip)))
+            })
+        })?,
+    )?;
+
+    table.set(
+        "is_from_subnet",
+        lua.create_function(move |lua, cidr: String| {
+            let (network_ip, prefix_len) = parse_cidr(&cidr)?;
+            lua.create_function(move |_, req: Table| {
+                let remote_ip: String = req.get("remote_ip")?;
+                let Ok(remote) = remote_ip.parse::<IpAddr>() else {
+                    return Ok(false);
+                };
+                Ok(ip_in_subnet(remote, network_ip, prefix_len))
+            })
+        })?,
+    )?;
+
+    table.set(
+        "is_from_my_subnet",
+        lua.create_function(move |lua, ()| {
+            lua.create_function(move |_, req: Table| {
+                let remote_ip: String = req.get("remote_ip")?;
+                let Ok(remote) = remote_ip.parse::<IpAddr>() else {
+                    return Ok(false);
+                };
+                Ok(is_private_or_loopback(remote))
+            })
+        })?,
+    )?;
+
+    Ok(table)
+}
+
+fn extract_host(headers: &HeaderMap) -> String {
+    header_value(headers, "host")
+        .map(|h| normalize_host_value(&h))
+        .unwrap_or_default()
+}
+
+fn header_value(headers: &HeaderMap, header_name: &str) -> Option<String> {
+    headers
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+}
+
+fn parse_first_forwarded_for_ip(value: String) -> Option<String> {
+    value
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize_ip_string)
+}
+
+fn normalize_host_value(host: &str) -> String {
+    host.split(':').next().unwrap_or(host).trim().to_lowercase()
+}
+
+fn normalize_ip_string(ip: &str) -> String {
+    ip.trim()
+        .parse::<IpAddr>()
+        .map(|parsed| parsed.to_string())
+        .unwrap_or_else(|_| ip.trim().to_string())
+}
+
+fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    if let Some((start, end)) = pattern.split_once('*') {
+        path.starts_with(start) && path.ends_with(end)
+    } else {
+        path.contains(pattern)
+    }
+}
+
+fn parse_cidr(cidr: &str) -> LuaResult<(IpAddr, u8)> {
+    let (network, prefix_len_raw) = cidr
+        .split_once('/')
+        .ok_or_else(|| mlua::Error::external("CIDR must look like '<ip>/<prefix>'"))?;
+    let network_ip = network
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| mlua::Error::external("Invalid CIDR network IP"))?;
+    let prefix_len = prefix_len_raw
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| mlua::Error::external("Invalid CIDR prefix"))?;
+
+    match network_ip {
+        IpAddr::V4(_) if prefix_len <= 32 => Ok((network_ip, prefix_len)),
+        IpAddr::V6(_) if prefix_len <= 128 => Ok((network_ip, prefix_len)),
+        IpAddr::V4(_) => Err(mlua::Error::external("IPv4 CIDR prefix must be <= 32")),
+        IpAddr::V6(_) => Err(mlua::Error::external("IPv6 CIDR prefix must be <= 128")),
+    }
+}
+
+fn ip_in_subnet(ip: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
+    match (ip, network) {
+        (IpAddr::V4(ipv4), IpAddr::V4(v4_address)) => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            (u32::from(ipv4) & mask) == (u32::from(v4_address) & mask)
+        }
+        (IpAddr::V6(ipv6), IpAddr::V6(v6_address)) => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            (u128::from(ipv6) & mask) == (u128::from(v6_address) & mask)
+        }
+        _ => false,
+    }
+}
+
+fn is_private_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local() || ipv4.is_broadcast()
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unicast_link_local()
+                || (ipv6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 fn string_vec_to_lua_table(lua: &Lua, values: Vec<String>) -> LuaResult<Table> {
@@ -1576,7 +2099,7 @@ mod tests {
         let script = dir.join("basilisk.lua");
         fs::write(
             &script,
-            "basilisk.proxy.use('/api/private', function(req, res, next)\n  res:status(403):send('blocked')\nend)\n",
+            "basilisk.proxy.use(path_rules.has_prefix('/api/private'), function(req, res, next)\n  res:status(403):send('blocked')\nend)\n",
         )
         .expect("failed to write middleware script");
 

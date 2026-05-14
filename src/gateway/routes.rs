@@ -1,11 +1,13 @@
 use crate::gateway::AppState;
 use crate::models::{error_codes, ErrorDetail, ErrorResponse, RegistrationRequest};
+use axum::extract::ConnectInfo;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -14,12 +16,14 @@ const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
 /// Registers a service instance in the in-memory registry.
 pub async fn register(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(socket): ConnectInfo<SocketAddr>,
     Json(request): Json<RegistrationRequest>,
 ) -> impl IntoResponse {
     let registry = &state.registry;
     info!(
         "Registration attempt for service {} from instance {}",
-        request.service_id, request.instance.instance_id
+        request.service_id,
+        socket.ip().to_string()
     );
 
     // 1. Authenticate Registration (FR-1)

@@ -254,8 +254,26 @@ print(response.payload_json)
 `basilisk.proxy`
 
 - `use(handlerFn)` - global middleware
-- `use(pathPrefix, handlerFn)` - middleware on single path prefix
-- `use({pathPrefix1, pathPrefix2, ...}, handlerFn)` - middleware on multiple path prefixes
+- `use(ruleFn, handlerFn)` - middleware bound by predicate function (returns `true` to apply)
+- `use({ruleFn1, ruleFn2, ...}, handlerFn)` - middleware mounted for multiple predicate rules
+- `use_after(ruleFn, handlerFn)` - post-request middleware that runs after proxy handling
+- `use_after({ruleFn1, ruleFn2, ...}, handlerFn)` - post-request middleware mounted for multiple rules
+
+`path_rules`
+
+- `exact(path)` -> `ruleFn`
+- `matches(pattern)` -> `ruleFn` (`*` wildcard supported)
+- `has_prefix(prefix)` -> `ruleFn`
+- `has_prefix_in({prefix1, prefix2, ...})` -> `ruleFn`
+- `from_host(host)` -> `ruleFn`
+- `is_any_of({ruleFn1, ruleFn2, ...})` -> `ruleFn`
+
+`net_rules`
+
+- `is_ip(ip)` -> `ruleFn`
+- `is_ip_in({ip1, ip2, ...})` -> `ruleFn`
+- `is_from_subnet(cidr)` -> `ruleFn`
+- `is_from_my_subnet()` -> `ruleFn` (private/loopback/link-local)
 
 ## 6. Lua Middleware API
 
@@ -273,7 +291,12 @@ end
 
 - `req.path`
 - `req.method`
+- `req.host`
 - `req.headers` (header map, lowercase lookup is recommended)
+- `req.remote_addr` / `req.remote_ip` / `req.remote_port` (trusted socket peer data from `ConnectInfo`)
+- `req.claimed_ip` / `req.claimed_port` (forwarded headers when present)
+- `req.has_claimed_ip_mismatch` / `req.has_claimed_port_mismatch` / `req.is_spoofed_source`
+- `req.remote` (`{ addr, ip, port }`)
 - `req.ctx` (context dictionary for storing arbitrary values shared across middleware)
 - `req:auth(payloadTable)` - marshals Lua table to JSON and stores it in protected `X-Basilisk-Auth` header (Base64URL)
 
@@ -300,7 +323,7 @@ basilisk.proxy.use(function(req, res, next)
   return next()
 end)
 
-basilisk.proxy.use("/api/protected", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/api/protected"), function(req, res, next)
   -- Access context stored by previous middleware
   local user_id = req.ctx["user_id"]
   if not user_id then
@@ -320,7 +343,7 @@ end)
 Forward headers are propagated to the downstream service regardless of whether middleware short-circuits or continues. This is useful for adding authentication tokens, request IDs, or other metadata to proxied requests:
 
 ```lua
-basilisk.proxy.use("/api/", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/api/"), function(req, res, next)
   -- Add tracing header for downstream service
   res:forward_headers("X-Request-ID", "req-" .. os.time())
   return next()
@@ -343,7 +366,7 @@ end)
 Multiple path prefixes can be combined into single middleware using Lua array syntax. This is useful for applying the same middleware logic to several related routes:
 
 ```lua
-basilisk.proxy.use({"/api/users", "/api/orders", "/api/products"}, function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix_in({"/api/users", "/api/orders", "/api/products"}), function(req, res, next)
   -- This middleware applies to all three paths
   res:forward_headers("X-API-Version", "v2")
   return next()
@@ -353,7 +376,7 @@ end)
 Array syntax works seamlessly with context and forward headers:
 
 ```lua
-basilisk.proxy.use({"/admin", "/restricted"}, function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix_in({"/admin", "/restricted"}), function(req, res, next)
   local auth = req.headers["authorization"]
   if not auth then
     return res:status(403):send("forbidden")
@@ -364,7 +387,7 @@ basilisk.proxy.use({"/admin", "/restricted"}, function(req, res, next)
   return next()
 end)
 
-basilisk.proxy.use({"/admin", "/restricted"}, function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix_in({"/admin", "/restricted"}), function(req, res, next)
   if req.ctx.authenticated then
     res:forward_headers("X-Authenticated", "true")
   end
@@ -372,10 +395,45 @@ basilisk.proxy.use({"/admin", "/restricted"}, function(req, res, next)
 end)
 ```
 
-### 6.5 Example: endpoint auth termination at proxy edge
+### 6.5 Function-based route/network matching with `path_rules` and `net_rules`
+
+You can bind middleware using predicate functions instead of path-prefix strings. This is useful for host-aware routing, IP allowlists, and composite policies:
 
 ```lua
-basilisk.proxy.use("/api/private", function(req, res, next)
+local internal_paths = path_rules.is_any_of({
+  path_rules.exact("/admin"),
+  path_rules.matches("/internal/*")
+})
+
+local trusted_network = net_rules.is_from_subnet("10.20.0.0/16")
+
+basilisk.proxy.use(internal_paths, function(req, res, next)
+  if not trusted_network(req) then
+    return res:status(403):send("forbidden")
+  end
+  return next()
+end)
+```
+
+Because Basilisk passes the accepted socket endpoint to Lua request objects, `net_rules` evaluates the real remote peer (`req.remote_ip`/`req.remote_port`) instead of trusting forwarded client-provided headers.
+
+### 6.6 Post-request middleware with `use_after`
+
+`use_after` runs after request handling is complete (either routed upstream or failed). If a post middleware calls `res:send(...)`, it overrides the final response.
+
+```lua
+basilisk.proxy.use_after(path_rules.matches("*"), function(req, res, next)
+  if req.err then
+    return res:status(502):send("gateway post-check failed")
+  end
+  return next()
+end)
+```
+
+### 6.7 Example: endpoint auth termination at proxy edge
+
+```lua
+basilisk.proxy.use(path_rules.has_prefix("/api/private"), function(req, res, next)
   local auth = req.headers["authorization"]
   if auth == "Bearer internal-token" then
     return next()
@@ -387,7 +445,7 @@ basilisk.proxy.use("/api/private", function(req, res, next)
 end)
 ```
 
-### 6.6 Example: cache-backed JWT enrichment with `req:auth`
+### 6.8 Example: cache-backed JWT enrichment with `req:auth`
 
 This pattern uses cache as the token source and enriches downstream auth context.
 The `jwt` module below is an example module loaded from `modules/jwt.lua` via `require("jwt")`.
@@ -395,7 +453,7 @@ The `jwt` module below is an example module loaded from `modules/jwt.lua` via `r
 ```lua
 local jwt = require("jwt")
 
-basilisk.proxy.use("/api", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/api"), function(req, res, next)
     local device_id = req.headers["x-device-key"];
     if not device_id then
         return next()
@@ -426,7 +484,7 @@ basilisk.proxy.use("/api", function(req, res, next)
 end)
 ```
 
-### 6.7 Example: global middleware
+### 6.9 Example: global middleware
 
 ```lua
 basilisk.proxy.use(function(req, res, next)

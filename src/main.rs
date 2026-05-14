@@ -16,14 +16,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let mut args = std::env::args();
     let program = args.next().unwrap_or_else(|| "basilisk".to_string());
     let lua_entrypoint = args
@@ -43,6 +35,15 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&registry),
         Arc::clone(&connection_manager),
     )?;
+
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| config.clone().observability.log_level.into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     // Start Service Bus TCP server
     let sb_config = config.clone();

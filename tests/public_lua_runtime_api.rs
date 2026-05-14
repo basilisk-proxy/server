@@ -1,6 +1,6 @@
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use basilisk::lua_config::{load_config_and_runtime, LuaRuntime};
+use basilisk::lua_config::{load_config_and_runtime, LuaRuntime, RequestConnectionInfo};
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use basilisk::service_bus::contracts::{
@@ -9,6 +9,7 @@ use basilisk::service_bus::contracts::{
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -58,7 +59,7 @@ fn middleware_pipeline_supports_next_and_short_circuit() {
          end\n\
          return next()\n\
          end)\n\
-         basilisk.proxy.use('/blocked', function(req, res, next)\n\
+         basilisk.proxy.use(path_rules.has_prefix('/blocked'), function(req, res, next)\n\
          return res:status(403):set('x-policy', 'lua'):send('blocked')\n\
          end)\n",
     )
@@ -111,7 +112,7 @@ fn cache_primitive_configures_provider_and_exposes_runtime_operations() {
          basilisk.cache.hash_set('session:1', 'user', 'basil')\n\
          basilisk.cache.set_add('tags', '3')\n\
          basilisk.cache.set_add('tags', '1')\n\
-         basilisk.proxy.use('/_cache', function(req, res, next)\n\
+         basilisk.proxy.use(path_rules.has_prefix('/_cache'), function(req, res, next)\n\
          res:forward_headers('X-Seeded', seeded)\n\
          res:forward_headers('X-Reused', reused)\n\
          res:forward_headers('X-Job-Length', tostring(basilisk.cache.list_length('jobs')))\n\
@@ -366,7 +367,7 @@ fn middleware_can_be_mounted_on_multiple_routes_using_array() {
     let script = dir.join("basilisk.lua");
     fs::write(
         &script,
-        "basilisk.proxy.use({'/api/users', '/api/orders', '/api/products'}, function(req, res, next)\n\
+         "basilisk.proxy.use(path_rules.has_prefix_in({'/api/users', '/api/orders', '/api/products'}), function(req, res, next)\n\
           res:forward_headers('X-Checked', 'true')\n\
           return next()\n\
          end)\n",
@@ -410,7 +411,7 @@ fn multi_path_middleware_can_short_circuit() {
     let script = dir.join("basilisk.lua");
     fs::write(
         &script,
-        "basilisk.proxy.use({'/admin', '/restricted', '/private'}, function(req, res, next)\n\
+         "basilisk.proxy.use(path_rules.has_prefix_in({'/admin', '/restricted', '/private'}), function(req, res, next)\n\
           return res:status(403):send('forbidden')\n\
          end)\n",
     )
@@ -444,11 +445,11 @@ fn multi_path_middleware_stores_context_properly() {
     let script = dir.join("basilisk.lua");
     fs::write(
         &script,
-        "basilisk.proxy.use({'/api/a', '/api/b'}, function(req, res, next)\n\
+         "basilisk.proxy.use(path_rules.has_prefix_in({'/api/a', '/api/b'}), function(req, res, next)\n\
           req.ctx['route_group'] = 'api_group'\n\
           return next()\n\
          end)\n\
-         basilisk.proxy.use({'/api/a', '/api/b'}, function(req, res, next)\n\
+          basilisk.proxy.use(path_rules.has_prefix_in({'/api/a', '/api/b'}), function(req, res, next)\n\
           if req.ctx['route_group'] == 'api_group' then\n\
             res:forward_headers('X-Route-Group', req.ctx['route_group'])\n\
           end\n\
@@ -489,11 +490,11 @@ fn multi_path_and_single_path_middleware_can_coexist() {
     let script = dir.join("basilisk.lua");
     fs::write(
         &script,
-        "basilisk.proxy.use({'/api/v1', '/api/v2'}, function(req, res, next)\n\
+         "basilisk.proxy.use(path_rules.has_prefix_in({'/api/v1', '/api/v2'}), function(req, res, next)\n\
           res:forward_headers('X-Version', 'multi')\n\
           return next()\n\
          end)\n\
-         basilisk.proxy.use('/admin', function(req, res, next)\n\
+          basilisk.proxy.use(path_rules.has_prefix('/admin'), function(req, res, next)\n\
           res:forward_headers('X-Admin', 'true')\n\
           return next()\n\
          end)\n\
@@ -554,6 +555,141 @@ fn multi_path_and_single_path_middleware_can_coexist() {
 }
 
 #[test]
+fn function_based_path_and_net_rules_can_mount_middleware_with_real_remote_info() {
+    let dir = test_dir("function_rules");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        "local admin_rule = path_rules.is_any_of({path_rules.exact('/admin'), path_rules.matches('/internal/*')})\n\
+         local host_rule = path_rules.from_host('api.local')\n\
+         local trusted_ip_rule = net_rules.is_ip_in({'10.0.0.5', '10.0.0.6'})\n\
+         basilisk.proxy.use(admin_rule, function(req, res, next)\n\
+           res:forward_headers('X-Admin-Rule', 'true')\n\
+           return next()\n\
+         end)\n\
+         basilisk.proxy.use(host_rule, function(req, res, next)\n\
+           res:forward_headers('X-Host-Rule', 'true')\n\
+           return next()\n\
+         end)\n\
+         basilisk.proxy.use(trusted_ip_rule, function(req, res, next)\n\
+           res:forward_headers('X-Net-Rule', 'true')\n\
+           return next()\n\
+         end)\n\
+         basilisk.proxy.use(function(req, res, next)\n\
+           if req.is_spoofed_source then\n\
+             res:forward_headers('X-Spoofed', 'true')\n\
+           end\n\
+           res:forward_headers('X-Remote-IP', req.remote_ip)\n\
+           res:forward_headers('X-Remote-Port', tostring(req.remote_port))\n\
+           return next()\n\
+         end)\n",
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+
+    let (_config, runtime, _cache) =
+        load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
+            .expect("failed to load runtime");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", "api.local:8080".parse().expect("valid host header"));
+    headers.insert(
+        "x-forwarded-for",
+        "203.0.113.10".parse().expect("valid forwarded-for header"),
+    );
+
+    let conn = RequestConnectionInfo::from_socket(SocketAddr::from(([10, 0, 0, 5], 4567)));
+    let result = runtime
+        .run_middlewares_with_connection("/internal/users", "GET", &headers, &conn)
+        .expect("middleware execution should succeed");
+
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Admin-Rule")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Host-Rule")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        result.forward_headers.get("X-Net-Rule").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        result.forward_headers.get("X-Spoofed").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Remote-IP")
+            .map(String::as_str),
+        Some("10.0.0.5")
+    );
+    assert_eq!(
+        result
+            .forward_headers
+            .get("X-Remote-Port")
+            .map(String::as_str),
+        Some("4567")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn use_after_can_override_response_when_error_is_present() {
+    let dir = test_dir("use_after");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        "basilisk.proxy.use_after(path_rules.matches('*'), function(req, res, next)\n\
+           if req.err then\n\
+             return res:status(502):set('x-after', 'handled'):send('after override')\n\
+           end\n\
+           return next()\n\
+         end)\n",
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+
+    let (_config, runtime, _cache) =
+        load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
+            .expect("failed to load runtime");
+
+    let conn = RequestConnectionInfo::from_socket(SocketAddr::from(([127, 0, 0, 1], 8080)));
+    let result = runtime
+        .run_after_middlewares_with_connection(
+            "/any",
+            "GET",
+            &HeaderMap::new(),
+            &conn,
+            Some("simulated error"),
+        )
+        .expect("after middleware execution should succeed")
+        .expect("after middleware should override response");
+
+    assert_eq!(result.status, 502);
+    assert_eq!(result.body, "after override");
+    assert_eq!(
+        result.headers.get("x-after").map(String::as_str),
+        Some("handled")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn lua_can_require_modules_from_modules_directory() {
     let dir = test_dir("require_module");
     let modules_dir = dir.join("modules");
@@ -575,7 +711,7 @@ fn lua_can_require_modules_from_modules_directory() {
     fs::write(
         &script,
         "local auth = require('auth')\n\
-         basilisk.proxy.use('/api', function(req, res, next)\n\
+          basilisk.proxy.use(path_rules.has_prefix('/api'), function(req, res, next)\n\
            res:forward_headers('X-Auth', auth.make_header(auth.token))\n\
            return next()\n\
          end)\n",
@@ -645,11 +781,11 @@ fn lua_modules_can_be_shared_across_middleware() {
     fs::write(
         &script,
         "local constants = require('constants')\n\
-         basilisk.proxy.use('/api', function(req, res, next)\n\
+          basilisk.proxy.use(path_rules.has_prefix('/api'), function(req, res, next)\n\
            res:forward_headers('X-API-Version', constants.api_version)\n\
            return next()\n\
          end)\n\
-         basilisk.proxy.use('/api', function(req, res, next)\n\
+          basilisk.proxy.use(path_rules.has_prefix('/api'), function(req, res, next)\n\
            res:forward_headers('X-Rate-Limit', constants.rate_limit)\n\
            return next()\n\
          end)\n",
@@ -698,7 +834,7 @@ received_topic = nil
 basilisk.service_bus.subscribe("lua.ping", function(event)
   received_topic = event.topic
 end)
-basilisk.proxy.use("/_check_sub", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/_check_sub"), function(req, res, next)
   if received_topic then
     res:forward_headers("X-Received-Topic", received_topic)
   end
@@ -759,7 +895,7 @@ basilisk.service_bus.subscribe("lua.once", function(event)
   received_after_unsub = event.topic
 end)
 basilisk.service_bus.unsubscribe("lua.once")
-basilisk.proxy.use("/_check_unsub", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/_check_unsub"), function(req, res, next)
   if received_after_unsub == nil then
     res:forward_headers("X-After-Unsub", "nil")
   else
@@ -828,7 +964,7 @@ if ok and resp then
   forward_payload_json = resp.payload_json
 end
 
-basilisk.proxy.use("/_check_forward", function(req, res, next)
+basilisk.proxy.use(path_rules.has_prefix("/_check_forward"), function(req, res, next)
   if forward_message_type then
     res:forward_headers("X-Forward-Message-Type", forward_message_type)
   end
