@@ -28,7 +28,7 @@ pub async fn run_server(
     info!("Service bus TCP server listening on {}", addr);
 
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
+        let (mut socket, peer_addr) = listener.accept().await?;
         debug!(peer = %peer_addr, "service bus client accepted");
         let connection_manager = Arc::clone(&connection_manager);
         let registry = Arc::clone(&registry);
@@ -36,6 +36,8 @@ pub async fn run_server(
         let connection_health_enabled = config.service_bus.connection_health_enabled;
         let monitoring_enabled = config.service_bus.monitoring_enabled;
 
+
+        // Run this separately.
         tokio::spawn(async move {
             if let Err(e) = handle_client(
                 socket,
@@ -54,7 +56,7 @@ pub async fn run_server(
 }
 
 async fn handle_client(
-    socket: TcpStream,
+    mut socket: TcpStream,
     connection_manager: Arc<ConnectionManager>,
     registry: Arc<ServiceRegistry>,
     max_message_chars: usize,
@@ -82,8 +84,8 @@ async fn handle_client(
                     },
                 };
                 if bytes_read == 0 {
-                    debug!(peer = ?peer, "service bus inbound connection idle loop");
-                    continue;
+                    debug!(peer = ?peer, "service bus inbound connection closed");
+                    break;
                 }
 
                 if line.len() > max_message_chars {
