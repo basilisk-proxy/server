@@ -15,6 +15,10 @@ basilisk.gateway.strip_prefix(false)
 -- Security settings
 basilisk.security.service_registration_auth("TOKEN")
 basilisk.security.registration_token("secret-token")
+basilisk.security.registration_allowlist({
+  net_rules.is_ip("127.0.0.1"),
+  net_rules.is_from_subnet("10.20.0.0/16")
+})
 
 -- Service bus settings
 basilisk.service_bus.enabled(true)

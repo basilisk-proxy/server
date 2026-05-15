@@ -23,6 +23,7 @@ pub struct LuaRuntime {
     lua: Mutex<Lua>,
     before_middlewares: Mutex<Vec<MiddlewareMount>>,
     after_middlewares: Mutex<Vec<MiddlewareMount>>,
+    registration_allowlist_rules: Mutex<Vec<RegistryKey>>,
     /// Registered service-bus event handlers: topic → handler key.
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
     /// Channel sender used by the background bus-dispatch task to deliver events
@@ -125,6 +126,7 @@ pub fn load_config_and_runtime(
 
     let before_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
     let after_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
+    let registration_allowlist_rules = Arc::new(Mutex::new(Vec::<RegistryKey>::new()));
     let config_state = Arc::new(Mutex::new(GatewayConfig::default()));
     let cache = Arc::new(GatewayCache::new("memory")?);
     let event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>> =
@@ -138,6 +140,7 @@ pub fn load_config_and_runtime(
         Arc::clone(&connection_manager),
         Arc::clone(&before_middleware_mounts),
         Arc::clone(&after_middleware_mounts),
+        Arc::clone(&registration_allowlist_rules),
         Arc::clone(&event_handlers),
     )
     .map_err(lua_to_anyhow)?;
@@ -187,6 +190,13 @@ pub fn load_config_and_runtime(
                 .drain(..)
                 .collect(),
         ),
+        registration_allowlist_rules: Mutex::new(
+            registration_allowlist_rules
+                .lock()
+                .map_err(|_| anyhow!("Lua registration allowlist lock poisoned"))?
+                .drain(..)
+                .collect(),
+        ),
         event_handlers,
         event_dispatch_tx,
     });
@@ -227,9 +237,45 @@ impl LuaRuntime {
             lua: Mutex::new(Lua::new()),
             before_middlewares: Mutex::new(Vec::new()),
             after_middlewares: Mutex::new(Vec::new()),
+            registration_allowlist_rules: Mutex::new(Vec::new()),
             event_handlers: Arc::new(Mutex::new(HashMap::new())),
             event_dispatch_tx,
         })
+    }
+
+    /// Evaluates registration source-IP allowlist rules.
+    ///
+    /// If no rules are configured, registration is allowed.
+    /// If rules are configured, at least one rule must return `true`.
+    pub fn is_registration_ip_allowed(
+        &self,
+        connection_info: &RequestConnectionInfo,
+    ) -> anyhow::Result<bool> {
+        let lua = self
+            .lua
+            .lock()
+            .map_err(|_| anyhow!("Lua runtime lock poisoned"))?;
+        let rule_keys = self
+            .registration_allowlist_rules
+            .lock()
+            .map_err(|_| anyhow!("Lua registration allowlist lock poisoned"))?;
+
+        if rule_keys.is_empty() {
+            return Ok(true);
+        }
+
+        let headers = HeaderMap::new();
+        let req = build_matcher_req_table(&lua, "", "REGISTER", &headers, "", connection_info)
+            .map_err(lua_to_anyhow)?;
+
+        for rule_key in rule_keys.iter() {
+            let rule: Function = lua.registry_value(rule_key).map_err(lua_to_anyhow)?;
+            if rule.call::<bool>(req.clone()).map_err(lua_to_anyhow)? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Dispatches a service-bus event to the registered Lua handler for the event's topic.
@@ -716,6 +762,7 @@ fn register_primitives(
     connection_manager: Arc<ConnectionManager>,
     before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
     after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    registration_allowlist_rules: Arc<Mutex<Vec<RegistryKey>>>,
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
 ) -> LuaResult<()> {
     let basilisk = lua.create_table()?;
@@ -723,7 +770,14 @@ fn register_primitives(
     basilisk.set("server", make_server_api(lua, Arc::clone(&config))?)?;
     basilisk.set("gateway", make_gateway_api(lua, Arc::clone(&config))?)?;
     basilisk.set("cache", make_cache_api(lua, Arc::clone(&config), cache)?)?;
-    basilisk.set("security", make_security_api(lua, Arc::clone(&config))?)?;
+    basilisk.set(
+        "security",
+        make_security_api(
+            lua,
+            Arc::clone(&config),
+            Arc::clone(&registration_allowlist_rules),
+        )?,
+    )?;
     basilisk.set(
         "observability",
         make_observability_api(lua, Arc::clone(&config))?,
@@ -1234,7 +1288,11 @@ fn make_cache_api(
     Ok(table)
 }
 
-fn make_security_api(lua: &Lua, config: Arc<Mutex<GatewayConfig>>) -> LuaResult<Table> {
+fn make_security_api(
+    lua: &Lua,
+    config: Arc<Mutex<GatewayConfig>>,
+    registration_allowlist_rules: Arc<Mutex<Vec<RegistryKey>>>,
+) -> LuaResult<Table> {
     let table = lua.create_table()?;
 
     let cfg = Arc::clone(&config);
@@ -1253,7 +1311,68 @@ fn make_security_api(lua: &Lua, config: Arc<Mutex<GatewayConfig>>) -> LuaResult<
         })?,
     )?;
 
+    let rules = Arc::clone(&registration_allowlist_rules);
+    table.set(
+        "registration_allowlist",
+        lua.create_function(move |lua, value: Value| {
+            let parsed = parse_rule_keys_value(lua, value, "security.registration_allowlist")?;
+            let mut guard = rules
+                .lock()
+                .map_err(|_| mlua::Error::external("Lua registration allowlist lock poisoned"))?;
+            *guard = parsed;
+            Ok(())
+        })?,
+    )?;
+
+    // Alias for discoverability.
+    let rules = Arc::clone(&registration_allowlist_rules);
+    table.set(
+        "registration_whitelist",
+        lua.create_function(move |lua, value: Value| {
+            let parsed = parse_rule_keys_value(lua, value, "security.registration_whitelist")?;
+            let mut guard = rules
+                .lock()
+                .map_err(|_| mlua::Error::external("Lua registration allowlist lock poisoned"))?;
+            *guard = parsed;
+            Ok(())
+        })?,
+    )?;
+
     Ok(table)
+}
+
+fn parse_rule_keys_value(lua: &Lua, value: Value, api_name: &str) -> LuaResult<Vec<RegistryKey>> {
+    match value {
+        Value::Function(rule) => Ok(vec![lua.create_registry_value(rule)?]),
+        Value::Table(table) => {
+            let mut keys = Vec::new();
+            let mut index = 1;
+            loop {
+                let value: Value = table.raw_get(index)?;
+                match value {
+                    Value::Function(rule) => {
+                        keys.push(lua.create_registry_value(rule)?);
+                        index += 1;
+                    }
+                    Value::Nil => break,
+                    _ => {
+                        return Err(mlua::Error::external(format!(
+                            "{api_name} expects a rule function or an array of rule functions"
+                        )))
+                    }
+                }
+            }
+            if keys.is_empty() {
+                return Err(mlua::Error::external(format!(
+                    "{api_name} requires at least one rule function"
+                )));
+            }
+            Ok(keys)
+        }
+        _ => Err(mlua::Error::external(format!(
+            "{api_name} expects a rule function or an array of rule functions"
+        ))),
+    }
 }
 
 fn make_observability_api(lua: &Lua, config: Arc<Mutex<GatewayConfig>>) -> LuaResult<Table> {

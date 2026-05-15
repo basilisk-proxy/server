@@ -89,4 +89,5 @@ pub mod error_codes {
     pub const AUTH_FAILED: &str = "AUTH_FAILED";
     pub const INVALID_CONFIG: &str = "INVALID_CONFIG";
     pub const FINGERPRINT_INVALID: &str = "FINGERPRINT_INVALID";
+    pub const REGISTRATION_IP_NOT_ALLOWED: &str = "REGISTRATION_IP_NOT_ALLOWED";
 }

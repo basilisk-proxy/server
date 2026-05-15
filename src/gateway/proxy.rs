@@ -591,10 +591,7 @@ fn is_self_routing(target_uri: &str, gateway_addr: SocketAddr) -> bool {
     };
 
     // Extract host:port (authority portion before the first '/').
-    let authority = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
 
     // Parse port: default 80 for http, 443 for https.
     let default_port: u16 = if target_uri.starts_with("https://") {
@@ -605,7 +602,9 @@ fn is_self_routing(target_uri: &str, gateway_addr: SocketAddr) -> bool {
 
     let (target_host, target_port) = if let Some(colon) = authority.rfind(':') {
         let host = &authority[..colon];
-        let port = authority[colon + 1..].parse::<u16>().unwrap_or(default_port);
+        let port = authority[colon + 1..]
+            .parse::<u16>()
+            .unwrap_or(default_port);
         (host, port)
     } else {
         (authority, default_port)

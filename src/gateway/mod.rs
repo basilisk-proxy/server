@@ -1,6 +1,6 @@
+pub mod header_limiter;
 pub mod proxy;
 pub mod routes;
-pub mod header_limiter;
 
 use crate::cache::GatewayCache;
 use crate::config::GatewayConfig;

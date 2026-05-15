@@ -5,13 +5,16 @@ use axum::Json;
 use basilisk::cache::GatewayCache;
 use basilisk::config::GatewayConfig;
 use basilisk::gateway::{proxy::ProxyHandler, routes, AppState};
+use basilisk::lua_config::load_config_and_runtime;
 use basilisk::lua_config::LuaRuntime;
 use basilisk::models::{AuthInfo, InstanceInfo, RegistrationRequest};
 use basilisk::observability::RuntimeTelemetry;
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::ConnectionManager;
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
@@ -43,6 +46,16 @@ fn registration_request(service_id: &str, instance_id: &str) -> RegistrationRequ
             token: "secret-token".to_string(),
         },
     }
+}
+
+fn test_dir(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "basilisk-public-routes-{}-{}",
+        name,
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&path).expect("failed to create temp test dir");
+    path
 }
 
 #[tokio::test]
@@ -118,4 +131,58 @@ async fn runtime_metrics_route_returns_snapshot_payload() {
     let json: serde_json::Value = serde_json::from_slice(&body).expect("body should be valid json");
     assert!(json.get("proxy_latency").is_some());
     assert!(json.get("service_distributions").is_some());
+}
+
+#[tokio::test]
+async fn register_route_respects_registration_allowlist() {
+    let dir = test_dir("registration_allowlist");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        "basilisk.security.registration_allowlist({\n\
+         net_rules.is_ip('127.0.0.1'),\n\
+         net_rules.is_from_subnet('10.20.0.0/16')\n\
+         })\n",
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+    let (config, lua_runtime, cache) = load_config_and_runtime(
+        &script.to_string_lossy(),
+        Arc::clone(&registry),
+        Arc::clone(&connection_manager),
+    )
+    .expect("failed to load lua runtime");
+
+    let state = Arc::new(AppState {
+        config,
+        gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+        registry,
+        connection_manager,
+        proxy_handler: ProxyHandler::new(),
+        lua_runtime,
+        cache,
+        telemetry: Arc::new(RuntimeTelemetry::new()),
+    });
+
+    let forbidden_response = routes::register(
+        State(Arc::clone(&state)),
+        ConnectInfo(SocketAddr::from(([192, 168, 1, 10], 9000))),
+        Json(registration_request("inventory", "inv-1")),
+    )
+    .await
+    .into_response();
+    assert_eq!(forbidden_response.status(), StatusCode::FORBIDDEN);
+
+    let allowed_response = routes::register(
+        State(Arc::clone(&state)),
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9001))),
+        Json(registration_request("inventory", "inv-2")),
+    )
+    .await
+    .into_response();
+    assert_eq!(allowed_response.status(), StatusCode::OK);
+
+    let _ = fs::remove_dir_all(dir);
 }

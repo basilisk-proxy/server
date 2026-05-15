@@ -1,4 +1,5 @@
 use crate::gateway::AppState;
+use crate::lua_config::RequestConnectionInfo;
 use crate::models::{error_codes, ErrorDetail, ErrorResponse, RegistrationRequest};
 use axum::extract::ConnectInfo;
 use axum::{
@@ -25,6 +26,42 @@ pub async fn register(
         request.service_id,
         socket.ip().to_string()
     );
+
+    let connection_info = RequestConnectionInfo::from_socket(socket);
+    match state
+        .lua_runtime
+        .is_registration_ip_allowed(&connection_info)
+    {
+        Ok(false) => {
+            warn!(
+                service_id = %request.service_id,
+                remote_ip = %socket.ip(),
+                remote_port = socket.port(),
+                "registration rejected by registration allowlist"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: ErrorDetail {
+                        code: error_codes::REGISTRATION_IP_NOT_ALLOWED.to_string(),
+                        message: "Registration source IP is not allowed".to_string(),
+                    },
+                }),
+            )
+                .into_response();
+        }
+        Ok(true) => {}
+        Err(err) => {
+            tracing::error!(
+                service_id = %request.service_id,
+                remote_ip = %socket.ip(),
+                remote_port = socket.port(),
+                error = %err,
+                "registration allowlist evaluation failed"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
 
     // 1. Authenticate Registration (FR-1)
     if state.config.security.service_registration_auth == "TOKEN" && request.auth.r#type != "token"

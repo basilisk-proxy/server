@@ -189,6 +189,8 @@ Runtime behavior notes:
 
 - `service_registration_auth(string)`
 - `registration_token(string)`
+- `registration_allowlist(ruleFn | {ruleFn1, ruleFn2, ...})`
+- `registration_whitelist(ruleFn | {ruleFn1, ruleFn2, ...})` (alias)
 
 `basilisk.observability`
 
@@ -274,6 +276,19 @@ print(response.payload_json)
 - `is_ip_in({ip1, ip2, ...})` -> `ruleFn`
 - `is_from_subnet(cidr)` -> `ruleFn`
 - `is_from_my_subnet()` -> `ruleFn` (private/loopback/link-local)
+
+### 5.4 Registry registration IP allowlist with `net_rules`
+
+You can restrict which remote IPs are allowed to call `POST /registry/register` by wiring `net_rules` predicates into `basilisk.security.registration_allowlist(...)`.
+
+```lua
+basilisk.security.registration_allowlist({
+  net_rules.is_ip("127.0.0.1"),
+  net_rules.is_from_subnet("10.20.0.0/16")
+})
+```
+
+If the source IP does not match any configured rule, Basilisk rejects registration with HTTP `403` and error code `REGISTRATION_IP_NOT_ALLOWED`.
 
 ## 6. Lua Middleware API
 
