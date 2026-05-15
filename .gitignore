@@ -21,3 +21,5 @@ Thumbs.db
 # Project specific
 basilisk.lua
 /basilisk
+benchmarks/results/*.json
+benchmarks/.docker-config/

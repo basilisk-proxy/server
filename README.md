@@ -701,6 +701,35 @@ Run all tests:
 cargo test -- --nocapture
 ```
 
+### 11.1 Benchmark pipeline
+
+The benchmark harness is in `benchmarks/` inside this repository.
+It starts:
+
+- Basilisk from the local `Dockerfile`
+- a tiny Rust benchmark service built on the sibling `rust-client` crate
+- minimal NGINX and HAProxy frontends for side-by-side comparison traffic paths
+
+Run the benchmark pipeline from this repository root:
+
+```bash
+./benchmarks/scripts/run_benchmarks.sh
+```
+
+Optional load tuning:
+
+```bash
+BENCH_VUS=50 BENCH_DURATION=30s ./benchmarks/scripts/run_benchmarks.sh
+```
+
+Raw summaries are written to `benchmarks/results/*.json`. Use:
+
+```bash
+./benchmarks/scripts/teardown.sh
+```
+
+to stop the benchmark stack.
+
 ## 12. Operational Notes
 - Registry and service buses are in-memory; state is not persisted across restarts.
 - Cache is shared between Lua primitives and gateway internals through `AppState.cache`.

@@ -1,0 +1,63 @@
+name: basilisk-bench
+
+services:
+  basilisk:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: basilisk-proxy:bench
+    volumes:
+      - ../basilisk.lua:/etc/basilisk/basilisk.lua:ro
+    ports:
+      - "18080:8080"
+      - "15090:5090"
+    networks:
+      - bench-net
+
+  tiny-rust-client-service:
+    build:
+      context: ../..
+      dockerfile: proxy-server/benchmarks/tiny-rust-client-service/Dockerfile
+    image: tiny-rust-client-service:bench
+    depends_on:
+      - basilisk
+    environment:
+      BASILISK_GATEWAY_BASE_URL: http://basilisk:8080
+      BASILISK_BUS_HOST: basilisk
+      BASILISK_BUS_PORT: "5090"
+      BASILISK_REGISTRATION_TOKEN: secret-token
+      BENCH_SERVICE_ID: bench-service
+      BENCH_SERVICE_FINGERPRINT: bench-service-v1
+      BENCH_PATH_PREFIX: /bench
+      BENCH_BIND_HOST: 0.0.0.0
+      BENCH_BIND_PORT: "7001"
+      BENCH_ADVERTISED_HOST: tiny-rust-client-service
+      BENCH_WEIGHT: "1"
+    networks:
+      - bench-net
+
+  nginx-front:
+    image: nginx:1.27-alpine
+    depends_on:
+      - basilisk
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "19080:80"
+    networks:
+      - bench-net
+
+  haproxy-front:
+    image: haproxy:3.1-alpine
+    depends_on:
+      - basilisk
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "28080:80"
+    networks:
+      - bench-net
+
+networks:
+  bench-net:
+    name: basilisk-bench-net

@@ -1,0 +1,12 @@
+[package]
+name = "tiny-rust-client-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+rust-client = { path = "../../../rust-client" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
