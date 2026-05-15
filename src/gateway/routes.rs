@@ -9,7 +9,7 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
 
@@ -20,7 +20,7 @@ pub async fn register(
     Json(request): Json<RegistrationRequest>,
 ) -> impl IntoResponse {
     let registry = &state.registry;
-    info!(
+    debug!(
         "Registration attempt for service {} from instance {}",
         request.service_id,
         socket.ip().to_string()
@@ -104,7 +104,7 @@ pub async fn deregister(
     State(state): State<Arc<AppState>>,
     Path((service_id, instance_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    info!(service_id = %service_id, instance_id = %instance_id, "registry deregister request received");
+    debug!(service_id = %service_id, instance_id = %instance_id, "registry deregister request received");
     if state.registry.deregister(&service_id, &instance_id).await {
         info!(service_id = %service_id, instance_id = %instance_id, "registry deregister succeeded");
         if state.config.cache.enabled {
@@ -122,7 +122,7 @@ pub async fn deregister(
 /// Returns all currently registered services.
 pub async fn get_all_services(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let services = state.registry.get_all_services();
-    info!(
+    debug!(
         services_count = services.len(),
         "registry services snapshot requested"
     );
@@ -135,7 +135,7 @@ pub async fn get_service(
     Path(service_id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(service) = state.registry.get_service(&service_id) {
-        info!(service_id = %service_id, instances_count = service.instances.len(), "registry service details requested");
+        debug!(service_id = %service_id, instances_count = service.instances.len(), "registry service details requested");
         Json(service).into_response()
     } else {
         warn!(service_id = %service_id, "registry service details requested for unknown service");

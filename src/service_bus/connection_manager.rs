@@ -84,7 +84,7 @@ impl ConnectionManager {
             warn!(connection_key = %key, "attempted to remove reserved basilisk connection");
             return;
         }
-        info!(connection_key = %key, "service bus connection removed");
+        debug!(connection_key = %key, "service bus connection removed");
         self.connections.remove(key);
     }
 
@@ -92,7 +92,7 @@ impl ConnectionManager {
     pub fn authenticate(&self, key: &str) {
         if let Some(mut conn) = self.connections.get_mut(key) {
             conn.authenticated = true;
-            info!(
+            debug!(
                 connection_key = %key,
                 service_id = %conn.service_id,
                 instance_id = %conn.instance_id,
@@ -112,7 +112,7 @@ impl ConnectionManager {
                 }
             }
             if !added.is_empty() {
-                info!(
+                debug!(
                     connection_key = %key,
                     service_id = %conn.service_id,
                     instance_id = %conn.instance_id,
@@ -131,7 +131,7 @@ impl ConnectionManager {
             conn.subscriptions.retain(|t| !topics.contains(t));
             let removed = before.saturating_sub(conn.subscriptions.len());
             if removed > 0 {
-                info!(
+                debug!(
                     connection_key = %key,
                     service_id = %conn.service_id,
                     instance_id = %conn.instance_id,
@@ -221,7 +221,7 @@ impl ConnectionManager {
                 self.remove_connection(&sub_key);
             }
         }
-        info!(
+        debug!(
             topic = %event.topic,
             event_id = %event.event_id,
             correlation_id = event.correlation_id,
@@ -277,7 +277,7 @@ impl ConnectionManager {
 
         let request_id = format!("basilisk-{}", Uuid::now_v7());
         let reply_to_topic = format!("reply-to-{}", request_id);
-        info!(
+        debug!(
             request_id = %request_id,
             target_service_id = %req.target_service_id,
             message_type = %req.message_type,
@@ -328,7 +328,7 @@ impl ConnectionManager {
 
         match result {
             Ok(Some(event)) => {
-                info!(
+                debug!(
                     request_id = %request_id,
                     target_service_id = %req.target_service_id,
                     response_message_type = %event.message_type,

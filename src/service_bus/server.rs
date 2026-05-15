@@ -29,7 +29,7 @@ pub async fn run_server(
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
-        info!(peer = %peer_addr, "service bus client accepted");
+        debug!(peer = %peer_addr, "service bus client accepted");
         let connection_manager = Arc::clone(&connection_manager);
         let registry = Arc::clone(&registry);
         let max_message_chars = config.service_bus.max_message_chars;
@@ -62,11 +62,12 @@ async fn handle_client(
     monitoring_enabled: bool,
 ) -> anyhow::Result<()> {
     let peer = socket.peer_addr().ok();
-    info!(peer = ?peer, "service bus client session started");
+    debug!(peer = ?peer, "service bus client session started");
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let (tx, mut rx) = mpsc::unbounded_channel::<ServiceBusProtocolMessage>();
     let mut connection_key: Option<String> = None;
+    let mut connected_identity: Option<(String, String)> = None;
 
     let mut line = String::new();
 
@@ -75,20 +76,29 @@ async fn handle_client(
             result = reader.read_line(&mut line) => {
                 let bytes_read = match result {
                     Ok(b) => b,
-                    Err(_) => break,
+                    Err(e) => {
+                        error!(peer = ?peer, error = %e, "service bus inbound read failed");
+                        break;
+                    },
                 };
                 if bytes_read == 0 {
-                    break;
+                    debug!(peer = ?peer, "service bus inbound connection idle loop");
+                    continue;
                 }
 
                 if line.len() > max_message_chars {
                     warn!(peer = ?peer, length = line.len(), max_message_chars, "service bus inbound message exceeded maximum size");
-                    let _ = tx.send(ServiceBusProtocolMessage {
+                    let msg = ServiceBusProtocolMessage {
                         r#type: protocol_types::ERROR.to_string(),
                         error_code: Some("MESSAGE_TOO_LARGE".to_string()),
                         message: Some(format!("Message exceeds max allowed size of {} characters", max_message_chars)),
                         ..Default::default()
-                    });
+                    };
+                    if let Ok(mut json) = serde_json::to_string(&msg) {
+                        json.push('\n');
+                        let _ = writer.write_all(json.as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
                     break;
                 }
 
@@ -110,7 +120,7 @@ async fn handle_client(
 
                 match msg.r#type.as_str() {
                     protocol_types::CONNECT => {
-                        info!(peer = ?peer, "service bus connect message received");
+                        debug!(peer = ?peer, "service bus connect message received");
                         if connection_key.is_some() {
                             let _ = tx.send(ServiceBusProtocolMessage {
                                 r#type: protocol_types::ERROR.to_string(),
@@ -144,6 +154,7 @@ async fn handle_client(
                             } else {
                                 let key = format!("{}:{}", sid, iid);
                                 connection_key = Some(key.clone());
+                                connected_identity = Some((sid.clone(), iid.clone()));
                                 info!(
                                     peer = ?peer,
                                     connection_key = %key,
@@ -170,7 +181,7 @@ async fn handle_client(
                                         .await;
 
                                     if monitoring_enabled {
-                                        info!(
+                                        debug!(
                                             peer = ?peer,
                                             service_id = %sid,
                                             instance_id = %iid,
@@ -204,7 +215,7 @@ async fn handle_client(
                         if let Some(key) = &connection_key {
                             if connection_manager.is_authenticated(key) {
                                 if let Some(topics) = msg.topics {
-                                    info!(peer = ?peer, connection_key = %key, topics = ?topics, "service bus subscribe request accepted");
+                                    debug!(peer = ?peer, connection_key = %key, topics = ?topics, "service bus subscribe request accepted");
                                     connection_manager.add_subscriptions(key, topics);
                                     let _ = tx.send(ServiceBusProtocolMessage {
                                         r#type: protocol_types::ACK.to_string(),
@@ -246,7 +257,7 @@ async fn handle_client(
                                         };
 
                                         let delivered_count = connection_manager.publish(event.clone(), Some(key));
-                                        info!(
+                                        debug!(
                                             peer = ?peer,
                                             connection_key = %key,
                                             topic = %event.topic,
@@ -277,7 +288,7 @@ async fn handle_client(
                         if let Some(key) = &connection_key {
                             if connection_manager.is_authenticated(key) {
                                 if let Some(request) = &msg.forward_request {
-                                    info!(
+                                    debug!(
                                         peer = ?peer,
                                         connection_key = %key,
                                         target_service_id = %request.target_service_id,
@@ -308,10 +319,22 @@ async fn handle_client(
             msg = rx.recv() => {
                 if let Some(msg) = msg {
                     debug!(peer = ?peer, message_type = %msg.r#type, "service bus outbound message flushed");
-                    let mut json = serde_json::to_string(&msg)?;
+                    let mut json = match serde_json::to_string(&msg) {
+                        Ok(json) => json,
+                        Err(err) => {
+                            error!(peer = ?peer, error = %err, "failed to serialize outbound service bus message");
+                            break;
+                        }
+                    };
                     json.push('\n');
-                    writer.write_all(json.as_bytes()).await?;
-                    writer.flush().await?;
+                    if let Err(err) = writer.write_all(json.as_bytes()).await {
+                        warn!(peer = ?peer, error = %err, "service bus outbound write failed; terminating session");
+                        break;
+                    }
+                    if let Err(err) = writer.flush().await {
+                        warn!(peer = ?peer, error = %err, "service bus outbound flush failed; terminating session");
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -321,7 +344,10 @@ async fn handle_client(
 
     if let Some(key) = connection_key {
         if connection_health_enabled {
-            if let Some((sid, iid)) = connection_manager.get_connection_info(&key) {
+            let identity = connected_identity
+                .clone()
+                .or_else(|| connection_manager.get_connection_info(&key));
+            if let Some((sid, iid)) = identity {
                 if monitoring_enabled {
                     warn!(
                         peer = ?peer,
@@ -340,7 +366,7 @@ async fn handle_client(
         }
         connection_manager.remove_connection(&key);
     }
-    info!(peer = ?peer, "service bus client session ended");
+    debug!(peer = ?peer, "service bus client session ended");
     Ok(())
 }
 
@@ -386,7 +412,7 @@ async fn handle_forward_request(
 
     let request_id = format!("basilisk-{}", Uuid::now_v7());
     let reply_to_topic = format!("reply-to-{}", request_id);
-    info!(
+    debug!(
         connection_key = %key,
         request_id = %request_id,
         target_service_id = %forward_request.target_service_id,
@@ -441,7 +467,7 @@ async fn handle_forward_request(
                 );
             }
 
-            info!(
+            debug!(
                 connection_key = %key,
                 request_id = %request_id,
                 target_service_id = %forward_request.target_service_id,
