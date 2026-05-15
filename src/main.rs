@@ -92,8 +92,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Setup HTTP Gateway
+    let gateway_addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
     let state = Arc::new(AppState {
         config: config.clone(),
+        gateway_addr,
         registry: Arc::clone(&registry),
         connection_manager: Arc::clone(&connection_manager),
         proxy_handler: ProxyHandler::new(),
@@ -118,10 +120,9 @@ async fn main() -> anyhow::Result<()> {
         .fallback(any(ProxyHandler::handle_proxy))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
-    tracing::info!("HTTP Gateway listening on {}", addr);
+    tracing::info!("HTTP Gateway listening on {}", gateway_addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&gateway_addr).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

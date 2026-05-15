@@ -16,6 +16,7 @@ use std::sync::Arc;
 fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
         config: GatewayConfig::default(),
+        gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
         registry: Arc::new(ServiceRegistry::new()),
         connection_manager: Arc::new(ConnectionManager::new()),
         proxy_handler: ProxyHandler::new(),

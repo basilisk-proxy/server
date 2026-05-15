@@ -729,3 +729,49 @@ Check that:
 
 ### Proxy returns `503`
 - Verify at least one instance is `Up` with recent, stable metrics heartbeat.
+
+### HTTP 431 (Request Header Fields Too Large)
+
+This error occurs when request headers exceed the HTTP server's size limit (hyper default ~16KB total).
+
+**Causes:**
+- Client sending exceptionally large header values (e.g., huge cookies, auth tokens)
+- Accumulation of proxy headers (`X-Forwarded-*`) across multiple proxy hops
+- Headers growing through middleware processing
+
+**Solutions (in order of preference):**
+
+1. **Reduce header size client-side:**
+   - Remove unnecessary headers (Authorization, User-Agent, etc.)
+   - Compress large header values if supported
+   - Avoid repeating headers
+
+2. **Filter headers in Lua middleware:**
+   ```lua
+   basilisk.proxy.use(function(req, res, next)
+     -- Remove overly large header values before proxying
+     local max_header_size = 8 * 1024 -- 8KB per header
+     for name, value in pairs(req.headers) do
+       if type(value) == "string" and #value > max_header_size then
+         tracing.warn("header " .. name .. " exceeds size limit; stripping")
+         res:forward_headers(name, "")  -- remove or truncate
+       end
+     end
+     return next()
+   end)
+   ```
+
+3. **Deploy behind a front-end reverse proxy (nginx, HAProxy):**
+   - Configure a front proxy to buffer/normalize headers
+   - Example nginx config:
+     ```
+     large_client_header_buffers 4 32k;
+     ```
+   - This allows the front proxy to handle decompression and header aggregation while Basilisk processes normalized requests
+
+4. **Implement header aggregation middleware:**
+   - Combine repeated headers using proper HTTP semantics (comma-separated values)
+   - Deduplicate forwarded-for chains
+   - Example: limit `X-Forwarded-For` chain length to max five hops
+
+````

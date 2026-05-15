@@ -1,5 +1,6 @@
 pub mod proxy;
 pub mod routes;
+pub mod header_limiter;
 
 use crate::cache::GatewayCache;
 use crate::config::GatewayConfig;
@@ -8,12 +9,15 @@ use crate::lua_config::LuaRuntime;
 use crate::observability::RuntimeTelemetry;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Shared state passed to HTTP handlers and the reverse proxy fallback.
 pub struct AppState {
     /// Effective runtime configuration loaded from Lua.
     pub config: GatewayConfig,
+    /// The address this gateway is listening to on, used to detect self-routing loops.
+    pub gateway_addr: SocketAddr,
     /// In-memory service registry used for registration and route resolution.
     pub registry: Arc<ServiceRegistry>,
     /// Service bus connection manager used by service bus APIs.

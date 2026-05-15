@@ -28,14 +28,13 @@ pub async fn run_server(
     info!("Service bus TCP server listening on {}", addr);
 
     loop {
-        let (mut socket, peer_addr) = listener.accept().await?;
+        let (socket, peer_addr) = listener.accept().await?;
         debug!(peer = %peer_addr, "service bus client accepted");
         let connection_manager = Arc::clone(&connection_manager);
         let registry = Arc::clone(&registry);
         let max_message_chars = config.service_bus.max_message_chars;
         let connection_health_enabled = config.service_bus.connection_health_enabled;
         let monitoring_enabled = config.service_bus.monitoring_enabled;
-
 
         // Run this separately.
         tokio::spawn(async move {
@@ -56,7 +55,7 @@ pub async fn run_server(
 }
 
 async fn handle_client(
-    mut socket: TcpStream,
+    socket: TcpStream,
     connection_manager: Arc<ConnectionManager>,
     registry: Arc<ServiceRegistry>,
     max_message_chars: usize,

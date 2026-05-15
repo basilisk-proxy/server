@@ -43,6 +43,7 @@ async fn proxy_handler_applies_lua_middleware_before_route_resolution() {
 
     let state = Arc::new(AppState {
         config: GatewayConfig::default(),
+        gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
         registry,
         connection_manager,
         proxy_handler: ProxyHandler::new(),
@@ -122,6 +123,7 @@ async fn proxy_internal_cache_keys_are_prefixed_and_do_not_collide_with_user_key
 
     let state = Arc::new(AppState {
         config,
+        gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
         registry,
         connection_manager,
         proxy_handler: ProxyHandler::new(),

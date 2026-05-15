@@ -92,7 +92,7 @@ impl Default for GatewayConfig {
             },
             routing: RoutingOptions {
                 default_load_balancing_strategy: "ROUND_ROBIN".to_string(),
-                strip_prefix: false,
+                strip_prefix: true,
             },
             cache: CacheOptions {
                 enabled: true,
