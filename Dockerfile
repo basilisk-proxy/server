@@ -12,7 +12,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /src/target/release/basilisk /usr/local/bin/basilisk
-COPY ./basilisk.lua /etc/basilisk/basilisk.lua
+
+# Ideally, you are to maintain this volume mount externally but uncomment this for simpler set-ups.
+# COPY ./basilisk.lua /etc/basilisk/basilisk.lua
 
 EXPOSE 8080 5090
 ENTRYPOINT ["/usr/local/bin/basilisk"]
