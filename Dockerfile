@@ -2,8 +2,8 @@ FROM rust:1.94 AS builder
 
 WORKDIR /src
 COPY src ./src
-RUN cargo build --release
 COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
