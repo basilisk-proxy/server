@@ -168,6 +168,15 @@ async fn handle_client(
                                     registry
                                         .update_instance_status(&sid, &iid, InstanceStatus::Up)
                                         .await;
+
+                                    if monitoring_enabled {
+                                        info!(
+                                            peer = ?peer,
+                                            service_id = %sid,
+                                            instance_id = %iid,
+                                            "service bus connect accepted; monitoring is authoritative so status transition is deferred to metrics heartbeat evaluation"
+                                        );
+                                    }
                                 }
 
                                 let _ = tx.send(ServiceBusProtocolMessage {
@@ -313,10 +322,20 @@ async fn handle_client(
     if let Some(key) = connection_key {
         if connection_health_enabled {
             if let Some((sid, iid)) = connection_manager.get_connection_info(&key) {
-                info!(peer = ?peer, connection_key = %key, service_id = %sid, instance_id = %iid, "service bus client disconnected; marking instance down");
-                registry
-                    .update_instance_status(&sid, &iid, InstanceStatus::Down)
-                    .await;
+                if monitoring_enabled {
+                    warn!(
+                        peer = ?peer,
+                        connection_key = %key,
+                        service_id = %sid,
+                        instance_id = %iid,
+                        "service bus client disconnected; monitoring is authoritative so instance will transition down only after heartbeat timeout without metrics"
+                    );
+                } else {
+                    info!(peer = ?peer, connection_key = %key, service_id = %sid, instance_id = %iid, "service bus client disconnected; marking instance down");
+                    registry
+                        .update_instance_status(&sid, &iid, InstanceStatus::Down)
+                        .await;
+                }
             }
         }
         connection_manager.remove_connection(&key);

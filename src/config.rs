@@ -120,7 +120,7 @@ impl Default for GatewayConfig {
                 port: 5090,
                 max_message_chars: 65536,
                 connection_health_enabled: true,
-                monitoring_enabled: false,
+                monitoring_enabled: true,
             },
         }
     }

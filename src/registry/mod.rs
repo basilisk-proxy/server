@@ -324,13 +324,13 @@ impl ServiceRegistry {
     }
 
     /// Removes down instances that exceeded the configured timeout.
-    pub fn remove_stale_instances(&self, timeout: std::time::Duration) {
+    pub fn remove_stale_instances(&self, timeout: Duration) {
         let now = Utc::now();
         for mut service in self.services.iter_mut() {
             service.instances.retain(|_, instance| {
                 if instance.status == InstanceStatus::Down {
                     let elapsed = now.signed_duration_since(instance.last_heartbeat_utc);
-                    if elapsed.to_std().unwrap_or(std::time::Duration::ZERO) > timeout {
+                    if elapsed.to_std().unwrap_or(Duration::ZERO) > timeout {
                         info!(
                             service_id = %instance.service_id,
                             instance_id = %instance.instance_id,

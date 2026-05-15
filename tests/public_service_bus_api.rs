@@ -43,10 +43,12 @@ async fn start_test_bus_server_with_state(
     port: u16,
     manager: Arc<ConnectionManager>,
     registry: Arc<ServiceRegistry>,
+    monitoring_enabled: bool,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let mut config = GatewayConfig::default();
     config.service_bus.host = "127.0.0.1".to_string();
     config.service_bus.port = port;
+    config.service_bus.monitoring_enabled = monitoring_enabled;
     let handle = tokio::spawn(async move { run_server(config, manager, registry).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     handle
@@ -352,7 +354,8 @@ async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() 
     assert_eq!(instance.status, InstanceStatus::Down);
 
     let handle =
-        start_test_bus_server_with_state(port, Arc::clone(&manager), Arc::clone(&registry)).await;
+        start_test_bus_server_with_state(port, Arc::clone(&manager), Arc::clone(&registry), false)
+            .await;
 
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -413,6 +416,85 @@ async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() 
     })
     .await
     .expect("instance should transition to Down after disconnect");
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn monitoring_enabled_disconnect_does_not_force_immediate_down() {
+    let port = find_free_local_port();
+    let manager = Arc::new(ConnectionManager::new());
+    let registry = Arc::new(ServiceRegistry::new());
+
+    let reg_result = registry
+        .register(RegistrationRequest {
+            service_id: "orders".to_string(),
+            fingerprint: "fp-1".to_string(),
+            path_prefixes: vec!["/api/orders".to_string()],
+            instance: InstanceInfo {
+                instance_id: "orders-1".to_string(),
+                scheme: "http".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 18080,
+                weight: 1,
+            },
+            auth: AuthInfo {
+                r#type: "token".to_string(),
+                token: "token".to_string(),
+            },
+        })
+        .await;
+    assert!(reg_result.success);
+    let token = reg_result
+        .token
+        .expect("registration should return instance token");
+
+    let handle =
+        start_test_bus_server_with_state(port, Arc::clone(&manager), Arc::clone(&registry), true)
+            .await;
+
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("failed to connect to bus server");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let connect = ServiceBusProtocolMessage {
+        r#type: protocol_types::CONNECT.to_string(),
+        service_id: Some("orders".to_string()),
+        instance_id: Some("orders-1".to_string()),
+        token: Some(token),
+        ..Default::default()
+    };
+    let mut connect_line = serde_json::to_string(&connect).expect("serialize connect");
+    connect_line.push('\n');
+    writer
+        .write_all(connect_line.as_bytes())
+        .await
+        .expect("write connect");
+    let connect_resp = read_next_message(&mut reader).await;
+    assert_eq!(connect_resp.r#type, protocol_types::ACK);
+
+    // Simulate monitoring-derived Up state before disconnect.
+    registry
+        .update_instance_status("orders", "orders-1", InstanceStatus::Up)
+        .await;
+
+    drop(writer);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let service = registry
+        .get_service("orders")
+        .expect("orders service should remain present");
+    let instance = service
+        .instances
+        .get("orders-1")
+        .expect("orders instance should remain present");
+    assert_eq!(
+        instance.status,
+        InstanceStatus::Up,
+        "disconnect must not force immediate Down when monitoring is enabled"
+    );
 
     handle.abort();
 }

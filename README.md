@@ -219,21 +219,21 @@ Runtime behavior notes:
 
 The Lua runtime runs on a reserved bus identity (`service_id = "basilisk"`, `instance_id = "lua-runtime"`) that is pre-authenticated at startup.
 
-When `connection_health_enabled(true)` is set (default), instance health is updated from the service bus lifecycle:
+When `connection_health_enabled(true)` is set (default), connection lifecycle can drive health transitions:
 
 - successful `connect` with a valid token => instance marked `Up`
-- `authenticate` remains available for compatibility, but is no longer required for normal clients
 - bus disconnect ⇒ instance marked `Down`
 
-This provides a low-overhead online/offline signal without active HTTP probing.
+When `monitoring_enabled(true)` is also set, monitoring is authoritative and overrides immediate connection lifecycle transitions:
 
-When `monitoring_enabled(true)` is set, Basilisk derives heartbeat from the last `basilisk.metrics.distribution` event seen per instance:
-
+- connect/disconnect no longer forces immediate status transitions
+- status is derived from `basilisk.metrics.distribution` cadence
 - no recent metrics within timeout => `Down`
 - increasingly irregular metrics cadence => `Degraded`
 - recent stable cadence => `Up`
+- disconnected instances move to `Down` only after the configured heartbeat timeout without metrics
 
-This lets health reflect both liveness and rhythm stability of each service instance.
+This supports long-lived TCP client sessions while still allowing graceful timeout-based health decay when metrics stop.
 
 ```lua
 basilisk.service_bus.subscribe("billing.events", function(event)
@@ -566,7 +566,7 @@ Transport: TCP, newline-delimited JSON messages.
 { "type": "connect", "serviceId": "orders", "instanceId": "<generated-instance-id>", "token": "<registration-token-issued-by-registry>" }
 ```
 
-`serviceId = "basilisk"` and `instanceId = "lua-runtime"` are reserved by the runtime and cannot be used by external clients. A connect attempt using either value is rejected with `errorCode = "RESERVED_IDENTITY"`.
+`serviceId = "basilisk"` and `instanceId = "lua-runtime"` are reserved by the runtime and cannot be used by external clients. A connection attempt using either value is rejected with `errorCode = "RESERVED_IDENTITY"`.
 
 The service bus validates the registration token during `connect`, so authenticated clients establish a usable connection in one round-trip.
 
@@ -634,10 +634,10 @@ Forward response:
 2. Registry endpoints are matched first.
 3. Non-registry routes enter `ProxyHandler` fallback.
 4. Lua middleware chain executes in registration order.
-5. If middleware ends response, request is short-circuited.
-6. Otherwise, service is resolved by longest matching path prefix.
+5. If middleware ends response, the request is short-circuited.
+6. Otherwise, service is resolved by the longest matching path prefix.
 7. Healthy instance selected by configured load-balancing strategy.
-8. Request is forwarded to selected instance.
+8. Request is forwarded to the selected instance.
 
 ### 9.2 Registry maintenance flow
 
