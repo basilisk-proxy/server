@@ -186,7 +186,7 @@ async fn handle_client(
                                             peer = ?peer,
                                             service_id = %sid,
                                             instance_id = %iid,
-                                            "service bus connect accepted; monitoring is authoritative so status transition is deferred to metrics heartbeat evaluation"
+                                            "service bus connect accepted; monitoring is authoritative so next status transition is deferred to metrics heartbeat evaluation"
                                         );
                                     }
                                 }

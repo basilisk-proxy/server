@@ -1,7 +1,7 @@
 import http from 'k6/http';
 import { check } from 'k6';
 
-const baseUrl = __ENV.TARGET_BASE_URL || 'http://basilisk:8080';
+const baseUrl = __ENV.TARGET_BASE_URL || 'http://basilisk:8084';
 const duration = __ENV.BENCH_DURATION || '20s';
 const vus = Number(__ENV.BENCH_VUS || 25);
 const payloadBytes = Number(__ENV.BENCH_PAYLOAD_BYTES || 8192);

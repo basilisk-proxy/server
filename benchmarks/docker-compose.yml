@@ -25,7 +25,7 @@ services:
       BASILISK_GATEWAY_BASE_URL: http://basilisk:8084
       BASILISK_BUS_HOST: basilisk
       BASILISK_BUS_PORT: "5090"
-      BASILISK_REGISTRATION_TOKEN: secret-token
+      BASILISK_REGISTRATION_TOKEN: "AGPjBYs5T/e2vBnJKmJqg0Q4R0Uj22qMNR6oDctp/dY="
       BENCH_SERVICE_ID: bench-service
       BENCH_SERVICE_FINGERPRINT: bench-service-v1
       BENCH_PATH_PREFIX: /bench

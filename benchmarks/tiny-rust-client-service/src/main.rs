@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let gateway_base_url = env_var("BASILISK_GATEWAY_BASE_URL", "http://basilisk:8080");
+    let gateway_base_url = env_var("BASILISK_GATEWAY_BASE_URL", "http://basilisk:8084");
     let bus_host = env_var("BASILISK_BUS_HOST", "basilisk");
     let bus_port = parse_env::<u16>("BASILISK_BUS_PORT", 5090)?;
     let registration_token = env_var("BASILISK_REGISTRATION_TOKEN", "secret-token");
@@ -50,8 +50,10 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/bench/ping", get(|| async { "pong" }))
-        .route("/bench/echo", post(|body: Bytes| async move { body }))
+        // Basilisk strips the registered path prefix (/bench) before forwarding,
+        // so the backend only sees the suffix: /ping and /echo.
+        .route("/ping", get(|| async { "pong" }))
+        .route("/echo", post(|body: Bytes| async move { body }))
         .with_state(basilisk_client);
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((

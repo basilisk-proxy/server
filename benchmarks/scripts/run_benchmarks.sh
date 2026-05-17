@@ -35,6 +35,7 @@ wait_for_url() {
   local label="$2"
   local required_service="$3"
   local start_ts
+  local attempt=0
   start_ts="$(date +%s)"
 
   while true; do
@@ -45,15 +46,23 @@ wait_for_url() {
       exit 1
     fi
 
-    if docker run --rm --network "$NETWORK_NAME" curlimages/curl:8.8.0 \
-      -fsS "$url" >/dev/null 2>&1; then
+    attempt=$((attempt + 1))
+    local curl_output
+    local curl_exit=0
+    curl_output=$(docker run --rm --network "$NETWORK_NAME" curlimages/curl:8.8.0 \
+      --max-time 5 --connect-timeout 3 -fsS "$url" 2>&1) || curl_exit=$?
+
+    if [ $curl_exit -eq 0 ]; then
+      echo "✓ ${label} is ready after ${attempt} attempts"
       break
     fi
 
-    if [ $(( $(date +%s) - start_ts )) -ge "$READY_TIMEOUT_SEC" ]; then
-      echo "Timed out waiting for ${label} at ${url} after ${READY_TIMEOUT_SEC}s" >&2
+    local elapsed=$(( $(date +%s) - start_ts ))
+    if [ $elapsed -ge "$READY_TIMEOUT_SEC" ]; then
+      echo "✗ Timed out waiting for ${label} at ${url} after ${READY_TIMEOUT_SEC}s (${attempt} attempts)" >&2
+      echo "  Last curl error (code=$curl_exit): $curl_output" >&2
       docker compose -f "$COMPOSE_FILE" ps >&2 || true
-      docker compose -f "$COMPOSE_FILE" logs --tail=120 basilisk tiny-rust-client-service >&2 || true
+      docker compose -f "$COMPOSE_FILE" logs --tail=150 basilisk tiny-rust-client-service >&2 || true
       exit 1
     fi
 
@@ -62,8 +71,8 @@ wait_for_url() {
 }
 
 # Wait for gateway control plane first, then for /bench route availability.
-wait_for_url "http://basilisk:8080/registry/services" "basilisk gateway" "basilisk"
-wait_for_url "http://basilisk:8080/bench/ping" "bench route" "tiny-rust-client-service"
+wait_for_url "http://basilisk:8084/registry/services" "basilisk gateway" "basilisk"
+wait_for_url "http://basilisk:8084/bench/ping" "bench route" "tiny-rust-client-service"
 
 run_case() {
   local label="$1"
@@ -82,7 +91,7 @@ run_case() {
   echo "Saved summary to $output"
 }
 
-run_case "basilisk-direct" "http://basilisk:8080"
+run_case "basilisk-direct" "http://basilisk:8084"
 run_case "nginx-front" "http://nginx-front"
 run_case "haproxy-front" "http://haproxy-front"
 
