@@ -23,6 +23,8 @@ The runtime is configured from a single Lua entry file passed on process startup
 - [9. Request Flow](#9-request-flow)
 - [10. Common Use Cases](#10-common-use-cases)
 - [11. Testing](#11-testing)
+    - [11.1 Benchmark pipeline](#111-benchmark-pipeline)
+    - [11.2 Benchmark results](#112-benchmark-results)
 - [12. Operational Notes](#12-operational-notes)
 - [13. Troubleshooting](#13-troubleshooting)
 
@@ -31,11 +33,11 @@ The runtime is configured from a single Lua entry file passed on process startup
 Basilisk runs two server surfaces in one process:
 
 1. **HTTP gateway** (`axum`):
-   - Registry endpoints under `/registry/*`
-   - Reverse-proxy fallback for all non-registry paths
+    - Registry endpoints under `/registry/*`
+    - Reverse-proxy fallback for all non-registry paths
 2. **TCP service bus**:
-   - Line-delimited JSON protocol
-   - Client connect/authenticated-subscribe/publish/forward operations
+    - Line-delimited JSON protocol
+    - Client connect/authenticated-subscribe/publish/forward operations
 
 Both surfaces share an in-memory `ServiceRegistry` and `ConnectionManager`.
 
@@ -48,16 +50,16 @@ Core modules:
 - `src/cache/`: provider-agnostic cache trait plus private backend strategies
 - `src/lua_config.rs`: Lua VM bootstrap, primitive registration, middleware execution
 - `src/gateway/`:
-  - `mod.rs`: `AppState`
-  - `routes.rs`: HTTP registry handlers
-  - `proxy.rs`: reverse proxy handler and load-balancing
+    - `mod.rs`: `AppState`
+    - `routes.rs`: HTTP registry handlers
+    - `proxy.rs`: reverse proxy handler and load-balancing
 - `src/registry/`:
-  - `mod.rs`: service registry storage and APIs
-  - `maintenance.rs`: metrics heartbeat evaluation and stale cleanup loop
+    - `mod.rs`: service registry storage and APIs
+    - `maintenance.rs`: metrics heartbeat evaluation and stale cleanup loop
 - `src/service_bus/`:
-  - `contracts.rs`: protocol message types
-  - `connection_manager.rs`: in-memory connection/subscription manager
-  - `server.rs`: TCP protocol server
+    - `contracts.rs`: protocol message types
+    - `connection_manager.rs`: in-memory connection/subscription manager
+    - `server.rs`: TCP protocol server
 - `tests/`: top-level integration tests for public APIs
 
 ## 3. Runtime Model
@@ -82,7 +84,8 @@ If missing or extra arguments are provided, the startup fails with usage help.
 
 ### Module system
 
-Basilisk sets Lua's `package.path` to `<entry-root>/modules/?.lua` at startup. Files in that directory can be loaded with standard `require`:
+Basilisk sets Lua's `package.path` to `<entry-root>/modules/?.lua` at startup. Files in that directory can be loaded
+with standard `require`:
 
 ```
 basilisk.lua
@@ -97,7 +100,8 @@ local auth = require("auth")
 local constants = require("constants")
 ```
 
-`require` is intentionally scoped to the `modules/` folder only. Files in the entry root itself are not reachable via `require`; use `load_lua_file` for those.
+`require` is intentionally scoped to the `modules/` folder only. Files in the entry root itself are not reachable via
+`require`; use `load_lua_file` for those.
 
 ## 4. Getting Started
 
@@ -165,7 +169,7 @@ basilisk.service_bus.port(5090)
 `basilisk.gateway`
 
 - `load_balancing_strategy(string)`
-  - Supported values in proxy selection: `ROUND_ROBIN`, `WEIGHTED_ROUND_ROBIN`, `WEIGHTED_RANDOM`, `IP_HASH`
+    - Supported values in proxy selection: `ROUND_ROBIN`, `WEIGHTED_ROUND_ROBIN`, `WEIGHTED_RANDOM`, `IP_HASH`
 - `strip_prefix(boolean)`
 
 `basilisk.cache`
@@ -183,7 +187,8 @@ Runtime behavior notes:
 
 - `basilisk.cache.*` data operations (`get`, `set`, `hash_*`, `list_*`, etc.) run against the active provider backend.
 - Lua middleware can use this as a shared runtime store for sessions, tokens, counters, and feature flags.
-- Basilisk-owned internal gateway keys stay isolated in the internal namespace and are filtered from `basilisk.cache.keys()`.
+- Basilisk-owned internal gateway keys stay isolated in the internal namespace and are filtered from
+  `basilisk.cache.keys()`.
 
 `basilisk.security`
 
@@ -219,14 +224,16 @@ Runtime behavior notes:
 
 ### 5.3 Lua service bus callbacks and forwarding
 
-The Lua runtime runs on a reserved bus identity (`service_id = "basilisk"`, `instance_id = "lua-runtime"`) that is pre-authenticated at startup.
+The Lua runtime runs on a reserved bus identity (`service_id = "basilisk"`, `instance_id = "lua-runtime"`) that is
+pre-authenticated at startup.
 
 When `connection_health_enabled(true)` is set (default), connection lifecycle can drive health transitions:
 
 - successful `connect` with a valid token => instance marked `Up`
 - bus disconnect ⇒ instance marked `Down`
 
-When `monitoring_enabled(true)` is also set, monitoring is authoritative and overrides immediate connection lifecycle transitions:
+When `monitoring_enabled(true)` is also set, monitoring is authoritative and overrides immediate connection lifecycle
+transitions:
 
 - connect/disconnect no longer forces immediate status transitions
 - status is derived from `basilisk.metrics.distribution` cadence
@@ -239,14 +246,14 @@ This supports long-lived TCP client sessions while still allowing graceful timeo
 
 ```lua
 basilisk.service_bus.subscribe("billing.events", function(event)
-  -- event.topic, event.message_type, event.payload are available
+    -- event.topic, event.message_type, event.payload are available
 end)
 
 local response = basilisk.service_bus.forward(
-  "orders",                 -- target service
-  "order.query",            -- message type
-  '{"orderId":"42"}',      -- optional JSON payload object
-  30000                      -- optional timeout in ms
+        "orders", -- target service
+        "order.query", -- message type
+        '{"orderId":"42"}', -- optional JSON payload object
+        30000                      -- optional timeout in ms
 )
 
 print(response.message_type)
@@ -279,16 +286,18 @@ print(response.payload_json)
 
 ### 5.4 Registry registration IP allowlist with `net_rules`
 
-You can restrict which remote IPs are allowed to call `POST /registry/register` by wiring `net_rules` predicates into `basilisk.security.registration_allowlist(...)`.
+You can restrict which remote IPs are allowed to call `POST /registry/register` by wiring `net_rules` predicates into
+`basilisk.security.registration_allowlist(...)`.
 
 ```lua
 basilisk.security.registration_allowlist({
-  net_rules.is_ip("127.0.0.1"),
-  net_rules.is_from_subnet("10.20.0.0/16")
+    net_rules.is_ip("127.0.0.1"),
+    net_rules.is_from_subnet("10.20.0.0/16")
 })
 ```
 
-If the source IP does not match any configured rule, Basilisk rejects registration with HTTP `403` and error code `REGISTRATION_IP_NOT_ALLOWED`.
+If the source IP does not match any configured rule, Basilisk rejects registration with HTTP `403` and error code
+`REGISTRATION_IP_NOT_ALLOWED`.
 
 ## 6. Lua Middleware API
 
@@ -297,7 +306,7 @@ Middlewares run before proxy routing and can either pass control or short-circui
 ### 6.1 Handler signature
 
 ```lua
-function (req, res, next)
+function(req, res, next)
     -- middleware logic here
 end
 ```
@@ -331,122 +340,131 @@ end
 
 ### 6.2 Request context dictionary
 
-The `req.ctx` object allows you to store arbitrary key-value pairs that persist across middleware executions. This is useful for propagating authentication credentials or other request context:
+The `req.ctx` object allows you to store arbitrary key-value pairs that persist across middleware executions. This is
+useful for propagating authentication credentials or other request context:
 
 ```lua
 basilisk.proxy.use(function(req, res, next)
-  -- Store authentication context for downstream use
-  req.ctx["user_id"] = "user123"
-  req.ctx["permissions"] = "read,write"
-  return next()
+    -- Store authentication context for downstream use
+    req.ctx["user_id"] = "user123"
+    req.ctx["permissions"] = "read,write"
+    return next()
 end)
 
 basilisk.proxy.use(path_rules.has_prefix("/api/protected"), function(req, res, next)
-  -- Access context stored by previous middleware
-  local user_id = req.ctx["user_id"]
-  if not user_id then
-    return res:status(401):send("unauthorized")
-  end
-  
-  -- Forward auth data to downstream service
-  local auth_data = string.format('{"user_id":"%s"}', user_id)
-  local encoded = require("base64").encode(auth_data)
-  res:forward_headers("X-Auth-Payload", encoded)
-  return next()
+    -- Access context stored by previous middleware
+    local user_id = req.ctx["user_id"]
+    if not user_id then
+        return res:status(401):send("unauthorized")
+    end
+
+    -- Forward auth data to downstream service
+    local auth_data = string.format('{"user_id":"%s"}', user_id)
+    local encoded = require("base64").encode(auth_data)
+    res:forward_headers("X-Auth-Payload", encoded)
+    return next()
 end)
 ```
 
 ### 6.3 Forward headers
 
-Forward headers are propagated to the downstream service regardless of whether middleware short-circuits or continues. This is useful for adding authentication tokens, request IDs, or other metadata to proxied requests:
+Forward headers are propagated to the downstream service regardless of whether middleware short-circuits or continues.
+This is useful for adding authentication tokens, request IDs, or other metadata to proxied requests:
 
 ```lua
 basilisk.proxy.use(path_rules.has_prefix("/api/"), function(req, res, next)
-  -- Add tracing header for downstream service
-  res:forward_headers("X-Request-ID", "req-" .. os.time())
-  return next()
+    -- Add tracing header for downstream service
+    res:forward_headers("X-Request-ID", "req-" .. os.time())
+    return next()
 end)
 ```
 
-**Reserved headers**: The header `X-Basilisk-Auth` is reserved and cannot be set by middleware. Attempting to set it will result in an error.
+**Reserved headers**: The header `X-Basilisk-Auth` is reserved and cannot be set by middleware. Attempting to set it
+will result in an error.
 
-Use `req:auth(payloadTable)` instead when you need to forward authorization context. Basilisk marshals the table as JSON, Base64URL-encodes it, and forwards it in `X-Basilisk-Auth`. The basilisk client library then decodes and unmarshals the payload for you for usage inside of your application services.
+Use `req:auth(payloadTable)` instead when you need to forward authorization context. Basilisk marshals the table as
+JSON, Base64URL-encodes it, and forwards it in `X-Basilisk-Auth`. The basilisk client library then decodes and
+unmarshals the payload for you for usage inside of your application services.
 
 ```lua
 basilisk.proxy.use(function(req, res, next)
-  req:auth({ sub = "user-123", scope = "orders.read" })
-  return next()
+    req:auth({ sub = "user-123", scope = "orders.read" })
+    return next()
 end)
 ```
 
 ### 6.4 Route groups with array syntax
 
-Multiple path prefixes can be combined into single middleware using Lua array syntax. This is useful for applying the same middleware logic to several related routes:
+Multiple path prefixes can be combined into single middleware using Lua array syntax. This is useful for applying the
+same middleware logic to several related routes:
 
 ```lua
-basilisk.proxy.use(path_rules.has_prefix_in({"/api/users", "/api/orders", "/api/products"}), function(req, res, next)
-  -- This middleware applies to all three paths
-  res:forward_headers("X-API-Version", "v2")
-  return next()
+basilisk.proxy.use(path_rules.has_prefix_in({ "/api/users", "/api/orders", "/api/products" }), function(req, res, next)
+    -- This middleware applies to all three paths
+    res:forward_headers("X-API-Version", "v2")
+    return next()
 end)
 ```
 
 Array syntax works seamlessly with context and forward headers:
 
 ```lua
-basilisk.proxy.use(path_rules.has_prefix_in({"/admin", "/restricted"}), function(req, res, next)
-  local auth = req.headers["authorization"]
-  if not auth then
-    return res:status(403):send("forbidden")
-  end
-  
-  -- Store auth info in context
-  req.ctx.authenticated = true
-  return next()
+basilisk.proxy.use(path_rules.has_prefix_in({ "/admin", "/restricted" }), function(req, res, next)
+    local auth = req.headers["authorization"]
+    if not auth then
+        return res:status(403):send("forbidden")
+    end
+
+    -- Store auth info in context
+    req.ctx.authenticated = true
+    return next()
 end)
 
-basilisk.proxy.use(path_rules.has_prefix_in({"/admin", "/restricted"}), function(req, res, next)
-  if req.ctx.authenticated then
-    res:forward_headers("X-Authenticated", "true")
-  end
-  return next()
+basilisk.proxy.use(path_rules.has_prefix_in({ "/admin", "/restricted" }), function(req, res, next)
+    if req.ctx.authenticated then
+        res:forward_headers("X-Authenticated", "true")
+    end
+    return next()
 end)
 ```
 
 ### 6.5 Function-based route/network matching with `path_rules` and `net_rules`
 
-You can bind middleware using predicate functions instead of path-prefix strings. This is useful for host-aware routing, IP allowlists, and composite policies:
+You can bind middleware using predicate functions instead of path-prefix strings. This is useful for host-aware routing,
+IP allowlists, and composite policies:
 
 ```lua
 local internal_paths = path_rules.is_any_of({
-  path_rules.exact("/admin"),
-  path_rules.matches("/internal/*")
+    path_rules.exact("/admin"),
+    path_rules.matches("/internal/*")
 })
 
 local trusted_network = net_rules.is_from_subnet("10.20.0.0/16")
 
 basilisk.proxy.use(internal_paths, function(req, res, next)
-  if not trusted_network(req) then
-    return res:status(403):send("forbidden")
-  end
-  return next()
+    if not trusted_network(req) then
+        return res:status(403):send("forbidden")
+    end
+    return next()
 end)
 ```
 
-Because Basilisk passes the accepted socket endpoint to Lua request objects, `net_rules` evaluates the real remote peer (`req.remote_ip`/`req.remote_port`) instead of trusting forwarded client-provided headers.
+Because Basilisk passes the accepted socket endpoint to Lua request objects, `net_rules` evaluates the real remote
+peer (`req.remote_ip`/`req.remote_port`) instead of trusting forwarded client-provided headers.
 
 ### 6.6 Post-request middleware with `use_after`
 
-`use_after` runs after request handling is complete (either routed upstream or failed). If a post middleware calls `res:send(...)`, it overrides the final response.
+`use_after` runs after request handling is complete (either routed upstream or failed). If a post middleware calls
+`res:send(...)`, it overrides the final response.
 
 ```lua
 basilisk.proxy.use_after(path_rules.matches("*"), function(req, res, next)
-  if req.err then
-    local took = res.metrics and res.metrics["proxy.total_ms_pre_after"] or 0
-    res:set("x-proxy-time-ms", tostring(took))
-    return res:status(502):send("gateway post-check failed")
-  end
-  return next()
+    if req.err then
+        local took = res.metrics and res.metrics["proxy.total_ms_pre_after"] or 0
+        res:set("x-proxy-time-ms", tostring(took))
+        return res:status(502):send("gateway post-check failed")
+    end
+    return next()
 end)
 ```
 
@@ -454,14 +472,14 @@ end)
 
 ```lua
 basilisk.proxy.use(path_rules.has_prefix("/api/private"), function(req, res, next)
-  local auth = req.headers["authorization"]
-  if auth == "Bearer internal-token" then
-    return next()
-  end
+    local auth = req.headers["authorization"]
+    if auth == "Bearer internal-token" then
+        return next()
+    end
 
-  return res:status(401)
-    :set("www-authenticate", "Bearer")
-    :send("unauthorized")
+    return res:status(401)
+              :set("www-authenticate", "Bearer")
+              :send("unauthorized")
 end)
 ```
 
@@ -508,10 +526,10 @@ end)
 
 ```lua
 basilisk.proxy.use(function(req, res, next)
-  if req.method == "OPTIONS" then
-    return res:status(204):send();
-  end
-  return next()
+    if req.method == "OPTIONS" then
+        return res:status(204):send();
+    end
+    return next()
 end)
 ```
 
@@ -529,7 +547,9 @@ Example request:
 {
   "serviceId": "orders",
   "fingerprint": "orders-v1",
-  "pathPrefixes": ["/api/orders"],
+  "pathPrefixes": [
+    "/api/orders"
+  ],
   "instance": {
     "instanceId": "",
     "scheme": "http",
@@ -548,7 +568,8 @@ Notes:
 
 - If `service_registration_auth == "TOKEN"`, `auth.type` must be `token` and token must match `registration_token`.
 - Path prefix ownership is exclusive across services.
-- If `instance.instanceId` is empty, Basilisk generates a cryptographically secure instance ID and returns it in the registration response.
+- If `instance.instanceId` is empty, Basilisk generates a cryptographically secure instance ID and returns it in the
+  registration response.
 
 ### 7.2 Deregister
 
@@ -578,17 +599,30 @@ Transport: TCP, newline-delimited JSON messages.
 ### 8.2 Connect/auth flow
 
 ```json
-{ "type": "connect", "serviceId": "orders", "instanceId": "<generated-instance-id>", "token": "<registration-token-issued-by-registry>" }
+{
+  "type": "connect",
+  "serviceId": "orders",
+  "instanceId": "<generated-instance-id>",
+  "token": "<registration-token-issued-by-registry>"
+}
 ```
 
-`serviceId = "basilisk"` and `instanceId = "lua-runtime"` are reserved by the runtime and cannot be used by external clients. A connection attempt using either value is rejected with `errorCode = "RESERVED_IDENTITY"`.
+`serviceId = "basilisk"` and `instanceId = "lua-runtime"` are reserved by the runtime and cannot be used by external
+clients. A connection attempt using either value is rejected with `errorCode = "RESERVED_IDENTITY"`.
 
-The service bus validates the registration token during `connect`, so authenticated clients establish a usable connection in one round-trip.
+The service bus validates the registration token during `connect`, so authenticated clients establish a usable
+connection in one round-trip.
 
 ### 8.3 Subscribe/publish
 
 ```json
-{ "type": "subscribe", "topics": ["service-orders", "billing-events"] }
+{
+  "type": "subscribe",
+  "topics": [
+    "service-orders",
+    "billing-events"
+  ]
+}
 ```
 
 ```json
@@ -603,14 +637,17 @@ The service bus validates the registration token during `connect`, so authentica
     "messageType": "invoice_created",
     "correlationId": 0,
     "causationId": null,
-    "payload": { "invoiceId": "inv-1" }
+    "payload": {
+      "invoiceId": "inv-1"
+    }
   }
 }
 ```
 
-Server normalizes server-controlled event fields (`eventId`, `emittedAtUtc`, `serviceId`, `instanceId`, `correlationId`).
+Server normalizes server-controlled event fields (`eventId`, `emittedAtUtc`, `serviceId`, `instanceId`,`correlationId`).
 
-If `monitoring_enabled(true)` is set, Basilisk monitors `basilisk.metrics.distribution` events and aggregates per-service distribution values in memory.
+If `monitoring_enabled(true)` is set, Basilisk monitors `basilisk.metrics.distribution` events and aggregates
+per-service distribution values in memory.
 
 ### 8.4 Forward request/response
 
@@ -622,7 +659,9 @@ Forward request:
   "forwardRequest": {
     "targetServiceId": "orders",
     "messageType": "order.query",
-    "payload": { "orderId": "42" },
+    "payload": {
+      "orderId": "42"
+    },
     "timeoutMs": 30000
   }
 }
@@ -635,7 +674,10 @@ Forward response:
   "type": "forward_response",
   "forwardResponse": {
     "messageType": "order.reply",
-    "payload": { "ok": true, "source": "orders" }
+    "payload": {
+      "ok": true,
+      "source": "orders"
+    }
   },
   "message": "Forward request completed"
 }
@@ -671,11 +713,13 @@ Background task:
 - Route traffic by prefix ownership.
 
 ### 10.2 Lightweight service-to-service event bus
+
 - Connect service instances with a valid registration token in a single handshake.
 - Subscribe to topic namespaces.
 - Publish typed events with correlation IDs.
 
 ### 10.3 Bus-driven forwarding between services
+
 - Use `type = "forward"` messages to request remote handling through the bus.
 - Receive structured `forward_response` payloads.
 
@@ -683,10 +727,12 @@ Background task:
 
 - Configure cache behavior in Lua with `basilisk.cache.*`.
 - Proxy route-resolution results are cached under Basilisk-owned internal keys.
-- Internal keys are namespaced with `basilisk:gateway:<key_prefix>:...` and hidden from user-facing `basilisk.cache.keys()`.
+- Internal keys are namespaced with `basilisk:gateway:<key_prefix>:...` and hidden from user-facing
+  `basilisk.cache.keys()`.
 - User keys (for middleware/runtime use) remain unprefixed and do not collide with proxy internals.
 
 ## 11. Testing
+
 Top-level integration tests are in `tests/`:
 
 - `tests/public_registry_api.rs`
@@ -710,7 +756,11 @@ It starts:
 - a tiny Rust benchmark service built on the sibling `rust-client` crate
 - minimal NGINX and HAProxy frontends for side-by-side comparison traffic paths
 
-Run the benchmark pipeline from this repository root:
+Two benchmark profiles are available:
+
+#### Throughput benchmark
+
+Measures requests per second and latency percentiles under a pure GET load against `/bench/ping`.
 
 ```bash
 ./benchmarks/scripts/run_benchmarks.sh
@@ -722,13 +772,87 @@ Optional load tuning:
 BENCH_VUS=50 BENCH_DURATION=30s ./benchmarks/scripts/run_benchmarks.sh
 ```
 
-Raw summaries are written to `benchmarks/results/*.json`. Use:
+Raw summaries are written to `benchmarks/results/*-summary.json`.
+
+#### Round-trip benchmark
+
+Measures the full proxy round-trip under a mixed GET/POST load. Each iteration either:
+
+- sends a `GET /bench/ping` and checks the `pong` response body, or
+- sends a `POST /bench/echo` with a configurable payload (`BENCH_PAYLOAD_BYTES`, default 8 KB) and verifies the body is
+  echoed back verbatim.
+
+The ratio of POST to GET requests is controlled via `BENCH_POST_RATIO` (default `0.7`).
+
+```bash
+./benchmarks/scripts/run_roundtrip_benchmarks.sh
+```
+
+Optional load tuning:
+
+```bash
+BENCH_VUS=50 BENCH_DURATION=30s BENCH_PAYLOAD_BYTES=4096 BENCH_POST_RATIO=0.5 \
+  ./benchmarks/scripts/run_roundtrip_benchmarks.sh
+```
+
+Raw summaries are written to `benchmarks/results/*-roundtrip-summary.json`.
+
+#### Summarizing results
+
+```bash
+python3 benchmarks/scripts/summarize_roundtrip_results.py \
+  --results-dir benchmarks/results \
+  --format markdown
+```
+
+Pass `--format json` and `--output <file>` to produce a machine-readable report. Use `--max-p95-regression-percent <N>`
+to gate on p95 latency regression relative to the baseline (Basilisk direct).
+
+#### Tearing down
 
 ```bash
 ./benchmarks/scripts/teardown.sh
 ```
 
-to stop the benchmark stack.
+### 11.2 Benchmark results
+
+The results below were recorded on the development machine described in the table. All three traffic paths (Basilisk
+direct, NGINX front, HAProxy front) run within Docker Compose on the same host.
+
+**Test machine**
+
+| Property        | Value                                                                      |
+|-----------------|----------------------------------------------------------------------------|
+| OS              | Ubuntu 25.04 (Plucky Puffin)                                               |
+| Kernel          | 6.14.0-37-generic                                                          |
+| CPU             | Intel Core i5-10210U @ 1.60 GHz (4 cores / 8 threads, up to 4.2 GHz boost) |
+| RAM             | 16 GiB                                                                     |
+| Primary storage | Intel Optane NVMe SSD 476.9 GB                                             |
+
+**Throughput (GET `/bench/ping`)**
+
+| Traffic path    | Req/s   | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
+|-----------------|---------|-----------|--------------|----------|----------|----------|
+| basilisk-direct | 5302.69 | 106079    | 100.00       | 4.23     | 2.80     | 11.75    |
+| haproxy-front   | 4439.73 | 88810     | 100.00       | 5.10     | 4.04     | 12.01    |
+| nginx-front     | 798.84  | 16026     | 100.00       | 30.60    | 13.43    | 157.45   |
+
+Baseline target: `basilisk-direct`
+- `haproxy-front` p95 delta vs. baseline: +2.23%
+- `nginx-front` p95 delta vs. baseline: +1240.40%
+
+**Round-trip (mixed GET ping / POST echo, 8 KB payload, 70 % POST)**
+
+| Traffic path            | Req/s    | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
+|-------------------------|----------|-----------|--------------|----------|----------|----------|
+| basilisk-direct-summary | 11999.26 | 240007    | 100.00       | 1.92     | 1.69     | 3.75     |
+| haproxy-front-summary   | 9738.09  | 194775    | 100.00       | 2.36     | 2.14     | 4.40     |
+| nginx-front-summary     | 1048.92  | 21005     | 100.00       | 23.72    | 4.26     | 67.51    |
+
+Baseline target: `basilisk-direct-summary`
+- `haproxy-front-summary` p95 delta vs. baseline: +17.59%
+- `nginx-front-summary` p95 delta vs. baseline: +1702.19%
+
 
 ## 12. Operational Notes
 - Registry and service buses are in-memory; state is not persisted across restarts.
@@ -737,10 +861,13 @@ to stop the benchmark stack.
 - Lua middleware runs in-process; panics or heavy logic can impact request latency.
 - `service_bus.max_message_chars` limits inbound line length per client message.
 - Runtime telemetry is available at `GET /registry/metrics/runtime`.
-- Proxy latency is aggregated by phase (`proxy.middleware`, `proxy.resolve_service`, `proxy.pick_healthy_instance`, `proxy.send_upstream_request`, `proxy.wait_upstream_response_body`, `proxy.total`).
+- Proxy latency is aggregated by phase (`proxy.middleware`, `proxy.resolve_service`, `proxy.pick_healthy_instance`,
+  `proxy.send_upstream_request`, `proxy.wait_upstream_response_body`, `proxy.total`).
 - TLS config fields exist in runtime config; bind/termination behavior depends on the current HTTP serving setup.
-- Tracing filter source precedence: `RUST_LOG` when set, otherwise `basilisk.observability.log_level(...)` from Lua startup config.
-- Registry and service-bus flows emit structured logs with service/instance identifiers, topics, correlation IDs, and delivery counts for audit/debug workflows.
+- Tracing filter source precedence: `RUST_LOG` when set, otherwise `basilisk.observability.log_level(...)` from Lua
+  startup config.
+- Registry and service-bus flows emit structured logs with service/instance identifiers, topics, correlation IDs, and
+  delivery counts for audit/debug workflows.
 
 ## 13. Troubleshooting
 
@@ -755,6 +882,7 @@ cargo run -- basilisk.lua
 ### Lua include rejected
 
 Check that:
+
 - file ends with `.lua`
 - this file is a local filesystem path (not URL)
 - the file stays under the entry file root directory
@@ -768,10 +896,12 @@ Check that:
 - you are **not** trying to `require` a file from the entry root itself — use `load_lua_file` for that
 
 ### Proxy returns `404`
+
 - Verify service is registered and owns a matching path prefix.
 - Verify the route prefix and request path alignment.
 
 ### Proxy returns `503`
+
 - Verify at least one instance is `Up` with recent, stable metrics heartbeat.
 
 ### HTTP 431 (Request Header Fields Too Large)
@@ -779,6 +909,7 @@ Check that:
 This error occurs when request headers exceed the HTTP server's size limit (hyper default ~16KB total).
 
 **Causes:**
+
 - Client sending exceptionally large header values (e.g., huge cookies, auth tokens)
 - Accumulation of proxy headers (`X-Forwarded-*`) across multiple proxy hops
 - Headers growing through middleware processing
@@ -786,9 +917,9 @@ This error occurs when request headers exceed the HTTP server's size limit (hype
 **Solutions (in order of preference):**
 
 1. **Reduce header size client-side:**
-   - Remove unnecessary headers (Authorization, User-Agent, etc.)
-   - Compress large header values if supported
-   - Avoid repeating headers
+    - Remove unnecessary headers (Authorization, User-Agent, etc.)
+    - Compress large header values if supported
+    - Avoid repeating headers
 
 2. **Filter headers in Lua middleware:**
    ```lua
@@ -806,16 +937,15 @@ This error occurs when request headers exceed the HTTP server's size limit (hype
    ```
 
 3. **Deploy behind a front-end reverse proxy (nginx, HAProxy):**
-   - Configure a front proxy to buffer/normalize headers
-   - Example nginx config:
-     ```
-     large_client_header_buffers 4 32k;
-     ```
-   - This allows the front proxy to handle decompression and header aggregation while Basilisk processes normalized requests
+    - Configure a front proxy to buffer/normalize headers
+    - Example nginx config:
+      ```
+      large_client_header_buffers 4 32k;
+      ```
+    - This allows the front proxy to handle decompression and header aggregation while Basilisk processes normalized
+      requests
 
 4. **Implement header aggregation middleware:**
-   - Combine repeated headers using proper HTTP semantics (comma-separated values)
-   - Deduplicate forwarded-for chains
-   - Example: limit `X-Forwarded-For` chain length to max five hops
-
-````
+    - Combine repeated headers using proper HTTP semantics (comma-separated values)
+    - Deduplicate forwarded-for chains
+    - Example: limit `X-Forwarded-For` chain length to max five hops

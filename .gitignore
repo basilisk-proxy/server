@@ -22,4 +22,5 @@ Thumbs.db
 basilisk.lua
 /basilisk
 benchmarks/results/*.json
+benchmarks/results/*.md
 benchmarks/.docker-config/

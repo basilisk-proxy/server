@@ -1,23 +1,29 @@
 {
+  "root_group": {
+    "name": "",
+    "path": "",
+    "id": "d41d8cd98f00b204e9800998ecf8427e",
+    "groups": {},
+    "checks": {}
+  },
   "metrics": {
     "http_reqs": {
-      "values": {
-        "count": 2000,
-        "rate": 333.33
-      }
+      "count": 2000,
+      "rate": 333.33
     },
     "checks": {
-      "values": {
-        "rate": 1.0
-      }
+      "passes": 8000,
+      "fails": 0,
+      "value": 1.0
     },
     "http_req_duration": {
-      "values": {
-        "avg": 6.5,
-        "med": 5.8,
-        "p(95)": 11.4,
-        "p(99)": 18.0
-      }
+      "avg": 6.5,
+      "min": 1.2,
+      "med": 5.8,
+      "max": 42.1,
+      "p(90)": 9.8,
+      "p(95)": 11.4,
+      "p(99)": 18.0
     }
   }
 }

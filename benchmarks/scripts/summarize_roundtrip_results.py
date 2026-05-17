@@ -21,7 +21,6 @@ class BenchmarkRow:
     latency_avg_ms: float | None
     latency_p50_ms: float | None
     latency_p95_ms: float | None
-    latency_p99_ms: float | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,7 +31,6 @@ class BenchmarkRow:
             "latency_avg_ms": self.latency_avg_ms,
             "latency_p50_ms": self.latency_p50_ms,
             "latency_p95_ms": self.latency_p95_ms,
-            "latency_p99_ms": self.latency_p99_ms,
         }
 
 
@@ -48,9 +46,9 @@ def _as_float(value: Any) -> float | None:
 def _metric_values(summary: dict[str, Any], metric_name: str) -> dict[str, Any]:
     metrics = summary.get("metrics", {})
     metric = metrics.get(metric_name, {})
-    values = metric.get("values", {})
-    if isinstance(values, dict):
-        return values
+    # k6 --summary-export writes metric data flat (no "values" sub-key).
+    if isinstance(metric, dict):
+        return metric
     return {}
 
 
@@ -69,11 +67,10 @@ def _extract_row(path: str) -> BenchmarkRow:
         name=name,
         req_rate=_as_float(reqs.get("rate")),
         req_total=_as_float(reqs.get("count")),
-        check_rate=_as_float(checks.get("rate")),
+        check_rate=_as_float(checks.get("rate") if checks.get("rate") is not None else checks.get("value")),
         latency_avg_ms=_as_float(duration.get("avg")),
         latency_p50_ms=_as_float(duration.get("med")),
         latency_p95_ms=_as_float(duration.get("p(95)")),
-        latency_p99_ms=_as_float(duration.get("p(99)")),
     )
 
 
@@ -101,16 +98,31 @@ def _render_equal_width_table(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _render_markdown(rows: list[BenchmarkRow], baseline_name: str) -> str:
+def _render_gfm_table(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+
+    header = rows[0]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "|" + "|".join(["-" * (len(h) + 2) for h in header]) + "|",
+    ]
+
+    for row in rows[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+
+    return "\n".join(lines)
+
+
+def _render_markdown(rows: list[BenchmarkRow], baseline_name: str, flavor: str = "gfm") -> str:
     headers = [
-        "target",
-        "req/s",
-        "total req",
-        "check pass %",
-        "avg ms",
-        "p50 ms",
-        "p95 ms",
-        "p99 ms",
+        "Traffic path",
+        "Req/s",
+        "Total req",
+        "Check pass %",
+        "Avg (ms)",
+        "p50 (ms)",
+        "p95 (ms)",
     ]
 
     table_rows = [headers]
@@ -126,11 +138,13 @@ def _render_markdown(rows: list[BenchmarkRow], baseline_name: str) -> str:
                 _fmt_num(row.latency_avg_ms),
                 _fmt_num(row.latency_p50_ms),
                 _fmt_num(row.latency_p95_ms),
-                _fmt_num(row.latency_p99_ms),
             ]
         )
 
-    lines = ["```text", _render_equal_width_table(table_rows), "```"]
+    if flavor == "text":
+        lines = ["```text", _render_equal_width_table(table_rows), "```"]
+    else:
+        lines = [_render_gfm_table(table_rows)]
 
     if rows:
         lines.append("")
@@ -229,7 +243,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--format",
-        choices=("markdown", "json"),
+        choices=("markdown", "markdown-text", "json"),
         default="markdown",
         help="Output format for the report.",
     )
@@ -257,7 +271,11 @@ def main() -> int:
 
     rows = [_extract_row(path) for path in files]
     baseline = _find_baseline(rows, args.baseline)
-    markdown = _render_markdown(rows, baseline.name)
+    markdown = _render_markdown(
+        rows,
+        baseline.name,
+        flavor="text" if args.format == "markdown-text" else "gfm",
+    )
     report = _build_json_report(rows, baseline.name)
 
     output_content = markdown
