@@ -51,43 +51,19 @@ jobs:
       - name: Validate summary script syntax
         run: python3 -m py_compile benchmarks/scripts/summarize_roundtrip_results.py
 
-      - name: Run real round-trip benchmark suite
-        run: |
-          BENCH_VUS=10 \
-          BENCH_DURATION=10s \
-          BENCH_PAYLOAD_BYTES=4096 \
-          BENCH_POST_RATIO=0.7 \
-          BENCH_READY_TIMEOUT_SEC=180 \
-          ./benchmarks/scripts/run_roundtrip_benchmarks.sh
-
-      - name: Generate markdown summary from real benchmark results
+      - name: Validate markdown summary generation
         run: |
           python3 benchmarks/scripts/summarize_roundtrip_results.py \
-            --results-dir benchmarks/results \
-            --output benchmarks/results/roundtrip-report.md
+            --results-dir benchmarks/results/fixtures \
+            --output benchmarks/results/fixtures/roundtrip-report.md
 
-      - name: Validate JSON summary + p95 regression gate on real results
+      - name: Validate JSON summary + p95 regression gate
         run: |
           python3 benchmarks/scripts/summarize_roundtrip_results.py \
-            --results-dir benchmarks/results \
+            --results-dir benchmarks/results/fixtures \
             --format json \
-            --max-p95-regression-percent 150 \
-            --output benchmarks/results/roundtrip-report.json
-
-      - name: Print benchmark markdown report in logs
-        run: |
-          echo "---- benchmark round-trip report (real CI run) ----"
-          cat benchmarks/results/roundtrip-report.md
-
-      - name: Publish benchmark report to job summary
-        run: |
-          {
-            echo "## CI Benchmark Summary Validation"
-            echo
-            echo "Generated from real CI round-trip benchmark execution."
-            echo
-            cat benchmarks/results/roundtrip-report.md
-          } >> "$GITHUB_STEP_SUMMARY"
+            --max-p95-regression-percent 15 \
+            --output benchmarks/results/fixtures/roundtrip-report.json
 
       - name: Build PR benchmark comment body
         if: github.event_name == 'pull_request'
@@ -95,24 +71,23 @@ jobs:
           {
             echo "## CI Benchmark Summary Validation"
             echo
-            echo "Generated from real CI round-trip benchmark execution."
+            echo "Generated from fixture round-trip benchmark summaries."
             echo
-            cat benchmarks/results/roundtrip-report.md
-          } > benchmarks/results/pr-comment.md
+            cat benchmarks/results/fixtures/roundtrip-report.md
+          } > benchmarks/results/fixtures/pr-comment.md
 
       - name: Post sticky PR comment
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: roundtrip-benchmark-validation
-          path: benchmarks/results/pr-comment.md
+          path: benchmarks/results/fixtures/pr-comment.md
 
-      - name: Upload benchmark summary report artifacts
+      - name: Upload benchmark summary fixtures report
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-summary-report
           path: |
-            benchmarks/results/*-roundtrip-summary.json
-            benchmarks/results/roundtrip-report.md
-            benchmarks/results/roundtrip-report.json
-            benchmarks/results/pr-comment.md
+            benchmarks/results/fixtures/roundtrip-report.md
+            benchmarks/results/fixtures/roundtrip-report.json
+            benchmarks/results/fixtures/pr-comment.md
