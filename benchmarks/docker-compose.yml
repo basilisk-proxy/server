@@ -9,7 +9,7 @@ services:
     volumes:
       - ../basilisk.lua:/etc/basilisk/basilisk.lua:ro
     ports:
-      - "18080:8080"
+      - "18084:8084"
       - "15090:5090"
     networks:
       - bench-net
@@ -22,7 +22,7 @@ services:
     depends_on:
       - basilisk
     environment:
-      BASILISK_GATEWAY_BASE_URL: http://basilisk:8080
+      BASILISK_GATEWAY_BASE_URL: http://basilisk:8084
       BASILISK_BUS_HOST: basilisk
       BASILISK_BUS_PORT: "5090"
       BASILISK_REGISTRATION_TOKEN: secret-token
