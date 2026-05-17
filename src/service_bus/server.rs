@@ -3,9 +3,9 @@ use crate::models::InstanceStatus;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use crate::service_bus::contracts::{
-    protocol_types, ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
-    ServiceBusProtocolMessage, BASILISK_INSTANCE_ID, BASILISK_METRICS_DISTRIBUTION_TOPIC,
-    BASILISK_SERVICE_ID,
+    BASILISK_INSTANCE_ID, BASILISK_METRICS_DISTRIBUTION_TOPIC, BASILISK_SERVICE_ID,
+    ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
+    ServiceBusProtocolMessage, protocol_types,
 };
 use chrono::Utc;
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -235,9 +235,9 @@ async fn handle_client(
                         }
                     }
                     protocol_types::PUBLISH => {
-                        if let Some(key) = &connection_key {
-                            if connection_manager.is_authenticated(key) {
-                                if let Some(mut event) = msg.event {
+                        if let Some(key) = &connection_key
+                            && connection_manager.is_authenticated(key)
+                                && let Some(mut event) = msg.event {
                                     if event.topic.is_empty() {
                                         warn!(peer = ?peer, connection_key = %key, "service bus publish rejected: topic required");
                                         let _ = tx.send(ServiceBusProtocolMessage {
@@ -282,8 +282,6 @@ async fn handle_client(
                                         });
                                     }
                                 }
-                            }
-                        }
                     }
                     protocol_types::FORWARD => {
                         if let Some(key) = &connection_key {
@@ -386,7 +384,7 @@ async fn handle_forward_request(
                 error_code: Some("INVALID_FORWARD_REQUEST".to_string()),
                 message: Some("forwardRequest is required for forward messages".to_string()),
                 ..Default::default()
-            }
+            };
         }
     };
 
@@ -407,7 +405,7 @@ async fn handle_forward_request(
                 error_code: Some("CONNECTION_NOT_FOUND".to_string()),
                 message: Some("Forwarding connection is not available".to_string()),
                 ..Default::default()
-            }
+            };
         }
     };
 

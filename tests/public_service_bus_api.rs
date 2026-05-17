@@ -1,7 +1,7 @@
 use basilisk::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use basilisk::service_bus::contracts::{
-    protocol_types, ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusProtocolMessage,
-    BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
+    BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID, ServiceBusEventEnvelope, ServiceBusForwardRequest,
+    ServiceBusProtocolMessage, protocol_types,
 };
 use basilisk::{
     config::GatewayConfig,
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 fn find_free_local_port() -> u16 {
     let listener =

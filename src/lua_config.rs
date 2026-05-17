@@ -4,11 +4,11 @@ use crate::helper::set_headers;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
 use crate::service_bus::contracts::{
-    ServiceBusEventEnvelope, ServiceBusForwardRequest, BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
+    BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID, ServiceBusEventEnvelope, ServiceBusForwardRequest,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use axum::http::HeaderMap;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use mlua::{Function, Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value};
 use std::collections::{HashMap, HashSet};
@@ -1358,7 +1358,7 @@ fn parse_rule_keys_value(lua: &Lua, value: Value, api_name: &str) -> LuaResult<V
                     _ => {
                         return Err(mlua::Error::external(format!(
                             "{api_name} expects a rule function or an array of rule functions"
-                        )))
+                        )));
                     }
                 }
             }
@@ -1718,7 +1718,7 @@ fn parse_matcher_array(lua: &Lua, table: &Table) -> LuaResult<Vec<MiddlewareMatc
             _ => {
                 return Err(mlua::Error::external(
                     "matcher array must contain only rule functions",
-                ))
+                ));
             }
         }
     }
@@ -1733,114 +1733,142 @@ fn parse_matcher_array(lua: &Lua, table: &Table) -> LuaResult<Vec<MiddlewareMatc
 fn make_path_rules_api(lua: &Lua) -> LuaResult<Table> {
     let table = lua.create_table()?;
 
-    table.set(
-        "exact",
-        lua.create_function(move |lua, expected: String| {
-            lua.create_function(move |_, req: Table| Ok(req.get::<String>("path")? == expected))
-        })?,
-    )?;
-
-    table.set(
-        "matches",
-        lua.create_function(move |lua, pattern: String| {
-            lua.create_function(move |_, req: Table| {
-                let path = req.get::<String>("path")?;
-                Ok(path_matches_pattern(&path, &pattern))
-            })
-        })?,
-    )?;
-
-    table.set(
-        "has_prefix",
-        lua.create_function(move |lua, prefix: String| {
-            lua.create_function(move |_, req: Table| {
-                let path = req.get::<String>("path")?;
-                Ok(path.starts_with(&prefix))
-            })
-        })?,
-    )?;
-
+    table.set("exact", create_path_rule_exact_factory(lua)?)?;
+    table.set("matches", create_path_rule_matches_factory(lua)?)?;
+    table.set("has_prefix", create_path_rule_has_prefix_factory(lua)?)?;
     table.set(
         "has_prefix_in",
-        lua.create_function(move |lua, prefixes: Table| {
-            let mut values = Vec::new();
-            let mut index = 1;
-            loop {
-                let value: Value = prefixes.raw_get(index)?;
-                match value {
-                    Value::String(prefix) => {
-                        values.push(prefix.to_str()?.to_string());
-                        index += 1;
-                    }
-                    Value::Nil => break,
-                    _ => {
-                        return Err(mlua::Error::external(
-                            "path_rules.has_prefix_in expects an array of prefixes",
-                        ))
-                    }
-                }
-            }
-            if values.is_empty() {
-                return Err(mlua::Error::external(
-                    "path_rules.has_prefix_in requires at least one prefix",
-                ));
-            }
-            lua.create_function(move |_, req: Table| {
-                let path = req.get::<String>("path")?;
-                Ok(values.iter().any(|prefix| path.starts_with(prefix)))
-            })
-        })?,
+        create_path_rule_has_prefix_in_factory(lua)?,
     )?;
-
-    table.set(
-        "from_host",
-        lua.create_function(move |lua, expected_host: String| {
-            let expected = normalize_host_value(&expected_host);
-            lua.create_function(move |_, req: Table| {
-                let host = req.get::<String>("host")?;
-                Ok(normalize_host_value(&host) == expected)
-            })
-        })?,
-    )?;
-
-    table.set(
-        "is_any_of",
-        lua.create_function(move |lua, rules: Table| {
-            let mut keys = Vec::new();
-            let mut index = 1;
-            loop {
-                let value: Value = rules.raw_get(index)?;
-                match value {
-                    Value::Function(rule) => {
-                        keys.push(lua.create_registry_value(rule)?);
-                        index += 1;
-                    }
-                    Value::Nil => break,
-                    _ => {
-                        return Err(mlua::Error::external(
-                            "path_rules.is_any_of expects an array of rule functions",
-                        ))
-                    }
-                }
-            }
-            if keys.is_empty() {
-                return Err(mlua::Error::external(
-                    "path_rules.is_any_of requires at least one rule function",
-                ));
-            }
-            lua.create_function(move |lua, req: Table| {
-                for key in &keys {
-                    let rule: Function = lua.registry_value(key)?;
-                    if rule.call::<bool>(req.clone())? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            })
-        })?,
-    )?;
+    table.set("from_host", create_path_rule_from_host_factory(lua)?)?;
+    table.set("is_any_of", create_path_rule_is_any_of_factory(lua)?)?;
 
     Ok(table)
+}
+
+fn create_path_rule_exact_factory(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(move |lua, expected: String| {
+        lua.create_function(move |_, req: Table| Ok(req.get::<String>("path")? == expected))
+    })
+}
+
+fn create_path_rule_matches_factory(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(move |lua, pattern: String| {
+        lua.create_function(move |_, req: Table| {
+            let path = req.get::<String>("path")?;
+            Ok(path_matches_pattern(&path, &pattern))
+        })
+    })
+}
+
+fn create_path_rule_has_prefix_factory(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(move |lua, prefix: String| {
+        lua.create_function(move |_, req: Table| {
+            let path = req.get::<String>("path")?;
+            Ok(path.starts_with(&prefix))
+        })
+    })
+}
+
+fn create_path_rule_has_prefix_in_factory(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(move |lua, prefixes: Table| {
+        let values = parse_lua_string_array(
+            &prefixes,
+            "path_rules.has_prefix_in expects an array of prefixes",
+            "path_rules.has_prefix_in requires at least one prefix",
+        )?;
+
+        lua.create_function(move |_, req: Table| {
+            let path = req.get::<String>("path")?;
+            Ok(values.iter().any(|prefix| path.starts_with(prefix)))
+        })
+    })
+}
+
+fn create_path_rule_from_host_factory(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(move |lua, expected_host: String| {
+        let expected = normalize_host_value(&expected_host);
+        lua.create_function(move |_, req: Table| {
+            let host = req.get::<String>("host")?;
+            Ok(normalize_host_value(&host) == expected)
+        })
+    })
+}
+
+fn create_path_rule_is_any_of_factory(lua: &Lua) -> LuaResult<Function> {
+    lua.create_function(move |lua, rules: Table| {
+        let keys = parse_lua_rule_key_array(
+            lua,
+            &rules,
+            "path_rules.is_any_of expects an array of rule functions",
+            "path_rules.is_any_of requires at least one rule function",
+        )?;
+
+        lua.create_function(move |lua, req: Table| {
+            for key in &keys {
+                let rule: Function = lua.registry_value(key)?;
+                if rule.call::<bool>(req.clone())? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    })
+}
+
+fn parse_lua_string_array(
+    table: &Table,
+    expects_error: &str,
+    empty_error: &str,
+) -> LuaResult<Vec<String>> {
+    let mut values = Vec::new();
+    let mut index = 1;
+
+    loop {
+        let value: Value = table.raw_get(index)?;
+        match value {
+            Value::String(value) => {
+                values.push(value.to_str()?.to_string());
+                index += 1;
+            }
+            Value::Nil => break,
+            _ => return Err(mlua::Error::external(expects_error)),
+        }
+    }
+
+    if values.is_empty() {
+        return Err(mlua::Error::external(empty_error));
+    }
+
+    Ok(values)
+}
+
+fn parse_lua_rule_key_array(
+    lua: &Lua,
+    table: &Table,
+    expects_error: &str,
+    empty_error: &str,
+) -> LuaResult<Vec<RegistryKey>> {
+    let mut keys = Vec::new();
+    let mut index = 1;
+
+    loop {
+        let value: Value = table.raw_get(index)?;
+        match value {
+            Value::Function(rule) => {
+                keys.push(lua.create_registry_value(rule)?);
+                index += 1;
+            }
+            Value::Nil => break,
+            _ => return Err(mlua::Error::external(expects_error)),
+        }
+    }
+
+    if keys.is_empty() {
+        return Err(mlua::Error::external(empty_error));
+    }
+
+    Ok(keys)
 }
 
 fn make_net_rules_api(lua: &Lua) -> LuaResult<Table> {
@@ -1873,7 +1901,7 @@ fn make_net_rules_api(lua: &Lua) -> LuaResult<Table> {
                     _ => {
                         return Err(mlua::Error::external(
                             "net_rules.is_ip_in expects an array of IP strings",
-                        ))
+                        ));
                     }
                 }
             }
@@ -2025,7 +2053,7 @@ fn string_vec_to_lua_table(lua: &Lua, values: Vec<String>) -> LuaResult<Table> {
 }
 
 fn lua_table_to_json(table: Table) -> LuaResult<serde_json::Value> {
-    // Detect Lua array-style table with contiguous numeric keys [1..N].
+    // Detect Lua array-style table with contiguous numeric keys [1...N].
     let mut array_values = Vec::new();
     let mut index = 1;
     loop {
@@ -2063,7 +2091,7 @@ fn lua_table_to_json(table: Table) -> LuaResult<serde_json::Value> {
             _ => {
                 return Err(mlua::Error::external(
                     "req.auth payload table keys must be string or number",
-                ))
+                ));
             }
         };
         object.insert(key_string, lua_value_to_json(value)?);

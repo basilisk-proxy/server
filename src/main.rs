@@ -1,11 +1,15 @@
 use axum::{
-    routing::{any, delete, get, post},
     Router,
+    routing::{any, delete, get, post},
 };
-use basilisk::gateway::{proxy::ProxyHandler, routes, AppState};
+use basilisk::gateway::{
+    AppState,
+    proxy::{ProxyHandler, new_upstream_http_client},
+    routes,
+};
 use basilisk::lua_config::load_config_and_runtime;
 use basilisk::observability::RuntimeTelemetry;
-use basilisk::registry::{run_maintenance, ServiceRegistry};
+use basilisk::registry::{ServiceRegistry, run_maintenance};
 use basilisk::service_bus::connection_manager::ConnectionManager;
 use basilisk::service_bus::contracts::BASILISK_METRICS_DISTRIBUTION_TOPIC;
 use basilisk::service_bus::server::run_server;
@@ -101,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
         cache,
+        upstream_client: new_upstream_http_client(),
         telemetry,
     });
 

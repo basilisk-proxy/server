@@ -1,11 +1,11 @@
 use crate::service_bus::contracts::{
-    ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
-    ServiceBusProtocolMessage, BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID,
+    BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID, ServiceBusEventEnvelope, ServiceBusForwardRequest,
+    ServiceBusForwardResponse, ServiceBusProtocolMessage,
 };
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, info, warn};
 
 /// Active service-bus connection metadata tracked by the broker.
@@ -196,10 +196,10 @@ impl ConnectionManager {
         );
 
         // Internal subscribers
-        if let Some(tx) = self.internal_subscribers.get(&event.topic) {
-            if tx.send(event.clone()).is_ok() {
-                delivered_count += 1;
-            }
+        if let Some(tx) = self.internal_subscribers.get(&event.topic)
+            && tx.send(event.clone()).is_ok()
+        {
+            delivered_count += 1;
         }
 
         let subscribers = self.get_subscribers(&event.topic, exclude_key.unwrap_or(""));

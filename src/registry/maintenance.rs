@@ -2,7 +2,7 @@ use crate::config::GatewayConfig;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Runs the periodic registry maintenance loop.
 ///

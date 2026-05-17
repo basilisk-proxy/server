@@ -1,4 +1,4 @@
-use super::base::{apply_sort_options, sort_by_score_range, CacheProvider};
+use super::base::{CacheProvider, apply_sort_options, sort_by_score_range};
 use redis::{Client, Commands};
 
 pub(super) struct RedisCacheManager {

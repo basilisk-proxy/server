@@ -1,4 +1,4 @@
-use super::base::{apply_sort_options, sort_by_score_range, CacheProvider};
+use super::base::{CacheProvider, apply_sort_options, sort_by_score_range};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 

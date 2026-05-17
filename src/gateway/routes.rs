@@ -1,12 +1,12 @@
 use crate::gateway::AppState;
 use crate::lua_config::RequestConnectionInfo;
-use crate::models::{error_codes, ErrorDetail, ErrorResponse, RegistrationRequest};
+use crate::models::{ErrorDetail, ErrorResponse, RegistrationRequest, error_codes};
 use axum::extract::ConnectInfo;
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -90,10 +90,10 @@ pub async fn register(
             cache_enabled = state.config.cache.enabled,
             "registry registration succeeded"
         );
-        if state.config.cache.enabled {
-            if let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1) {
-                warn!("failed to advance registry cache version after register: {err}");
-            }
+        if state.config.cache.enabled
+            && let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1)
+        {
+            warn!("failed to advance registry cache version after register: {err}");
         }
         (
             StatusCode::OK,
@@ -144,10 +144,10 @@ pub async fn deregister(
     debug!(service_id = %service_id, instance_id = %instance_id, "registry deregister request received");
     if state.registry.deregister(&service_id, &instance_id).await {
         info!(service_id = %service_id, instance_id = %instance_id, "registry deregister succeeded");
-        if state.config.cache.enabled {
-            if let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1) {
-                warn!("failed to advance registry cache version after deregister: {err}");
-            }
+        if state.config.cache.enabled
+            && let Err(err) = state.cache.internal_incr(REGISTRY_VERSION_CACHE_KEY, 1)
+        {
+            warn!("failed to advance registry cache version after deregister: {err}");
         }
         StatusCode::OK.into_response()
     } else {

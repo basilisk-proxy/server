@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test-and-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust test suite
+        run: cargo test -- --nocapture
+
+      - name: Compile-check benchmark tiny service
+        run: cargo check --manifest-path benchmarks/tiny-rust-client-service/Cargo.toml
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate summary script syntax
+        run: python3 -m py_compile benchmarks/scripts/summarize_roundtrip_results.py
+
+      - name: Validate markdown summary generation
+        run: |
+          python3 benchmarks/scripts/summarize_roundtrip_results.py \
+            --results-dir benchmarks/results/fixtures \
+            --output benchmarks/results/fixtures/roundtrip-report.md
+
+      - name: Validate JSON summary + p95 regression gate
+        run: |
+          python3 benchmarks/scripts/summarize_roundtrip_results.py \
+            --results-dir benchmarks/results/fixtures \
+            --format json \
+            --max-p95-regression-percent 15 \
+            --output benchmarks/results/fixtures/roundtrip-report.json
+
+      - name: Build PR benchmark comment body
+        if: github.event_name == 'pull_request'
+        run: |
+          {
+            echo "## CI Benchmark Summary Validation"
+            echo
+            echo "Generated from fixture round-trip benchmark summaries."
+            echo
+            cat benchmarks/results/fixtures/roundtrip-report.md
+          } > benchmarks/results/fixtures/pr-comment.md
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: roundtrip-benchmark-validation
+          path: benchmarks/results/fixtures/pr-comment.md
+
+      - name: Upload benchmark summary fixtures report
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary-report
+          path: |
+            benchmarks/results/fixtures/roundtrip-report.md
+            benchmarks/results/fixtures/roundtrip-report.json
+            benchmarks/results/fixtures/pr-comment.md

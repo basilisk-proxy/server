@@ -1,4 +1,4 @@
-use super::base::{apply_sort_options, sort_by_score_range, CacheProvider};
+use super::base::{CacheProvider, apply_sort_options, sort_by_score_range};
 use memcache::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -70,10 +70,10 @@ impl MemcachedCacheManager {
 
     fn write_entry(&self, key: &str, entry: StoredEntry) {
         let ttl = ttl_for_entry(&entry);
-        if let Ok(raw) = serde_json::to_string(&entry) {
-            if self.set_raw(key, &raw, ttl) {
-                self.track_key(key);
-            }
+        if let Ok(raw) = serde_json::to_string(&entry)
+            && self.set_raw(key, &raw, ttl)
+        {
+            self.track_key(key);
         }
     }
 

@@ -3,7 +3,10 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use basilisk::config::GatewayConfig;
-use basilisk::gateway::{proxy::ProxyHandler, AppState};
+use basilisk::gateway::{
+    AppState,
+    proxy::{ProxyHandler, new_upstream_http_client},
+};
 use basilisk::lua_config::load_config_and_runtime;
 use basilisk::observability::RuntimeTelemetry;
 use basilisk::registry::ServiceRegistry;
@@ -49,6 +52,7 @@ async fn proxy_handler_applies_lua_middleware_before_route_resolution() {
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
         cache,
+        upstream_client: new_upstream_http_client(),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     });
 
@@ -129,6 +133,7 @@ async fn proxy_internal_cache_keys_are_prefixed_and_do_not_collide_with_user_key
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
         cache: Arc::clone(&cache),
+        upstream_client: new_upstream_http_client(),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     });
 

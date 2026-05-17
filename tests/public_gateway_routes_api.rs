@@ -1,12 +1,16 @@
+use axum::Json;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use basilisk::cache::GatewayCache;
 use basilisk::config::GatewayConfig;
-use basilisk::gateway::{proxy::ProxyHandler, routes, AppState};
-use basilisk::lua_config::load_config_and_runtime;
+use basilisk::gateway::{
+    AppState,
+    proxy::{ProxyHandler, new_upstream_http_client},
+    routes,
+};
 use basilisk::lua_config::LuaRuntime;
+use basilisk::lua_config::load_config_and_runtime;
 use basilisk::models::{AuthInfo, InstanceInfo, RegistrationRequest};
 use basilisk::observability::RuntimeTelemetry;
 use basilisk::registry::ServiceRegistry;
@@ -25,6 +29,7 @@ fn test_state() -> Arc<AppState> {
         proxy_handler: ProxyHandler::new(),
         lua_runtime: LuaRuntime::allow_all(),
         cache: Arc::new(GatewayCache::new("memory").expect("cache init")),
+        upstream_client: new_upstream_http_client(),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     })
 }
@@ -163,6 +168,7 @@ async fn register_route_respects_registration_allowlist() {
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
         cache,
+        upstream_client: new_upstream_http_client(),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     });
 

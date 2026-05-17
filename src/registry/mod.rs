@@ -66,26 +66,26 @@ impl ServiceRegistry {
 
         // 1. Check for prefix collisions
         for prefix in &request.path_prefixes {
-            if let Some(owner) = self.path_owners.get(prefix) {
-                if owner.value() != &request.service_id {
-                    warn!(
-                        service_id = %request.service_id,
-                        prefix = %prefix,
-                        owner_service_id = %owner.value(),
-                        "registry registration rejected due to route collision"
-                    );
-                    return RegistrationResult {
-                        success: false,
-                        instance_id: None,
-                        token: None,
-                        error_code: Some("ROUTE_COLLISION".to_string()),
-                        error_message: Some(format!(
-                            "Path prefix '{}' already owned by service '{}'",
-                            prefix,
-                            owner.value()
-                        )),
-                    };
-                }
+            if let Some(owner) = self.path_owners.get(prefix)
+                && owner.value() != &request.service_id
+            {
+                warn!(
+                    service_id = %request.service_id,
+                    prefix = %prefix,
+                    owner_service_id = %owner.value(),
+                    "registry registration rejected due to route collision"
+                );
+                return RegistrationResult {
+                    success: false,
+                    instance_id: None,
+                    token: None,
+                    error_code: Some("ROUTE_COLLISION".to_string()),
+                    error_message: Some(format!(
+                        "Path prefix '{}' already owned by service '{}'",
+                        prefix,
+                        owner.value()
+                    )),
+                };
             }
         }
 
@@ -186,50 +186,49 @@ impl ServiceRegistry {
     ///
     /// This sample stream is used to derive liveness and heartbeat regularity.
     pub fn record_metrics_heartbeat(&self, service_id: &str, instance_id: &str) {
-        if let Some(mut service) = self.services.get_mut(service_id) {
-            if let Some(instance) = service.instances.get_mut(instance_id) {
-                let now = Utc::now();
-                instance.last_heartbeat_utc = now;
-                debug!(
-                    service_id = %service_id,
-                    instance_id = %instance_id,
-                    "registry metrics heartbeat received"
-                );
+        if let Some(mut service) = self.services.get_mut(service_id)
+            && let Some(instance) = service.instances.get_mut(instance_id)
+        {
+            let now = Utc::now();
+            instance.last_heartbeat_utc = now;
+            debug!(
+                service_id = %service_id,
+                instance_id = %instance_id,
+                "registry metrics heartbeat received"
+            );
 
-                let key = metrics_key(service_id, instance_id);
-                if let Some(mut hb) = self.metrics_heartbeat.get_mut(&key) {
-                    let interval_ms = now
-                        .signed_duration_since(hb.last_seen_utc)
-                        .num_milliseconds()
-                        .max(1) as f64;
-                    hb.sample_count += 1;
-                    if hb.sample_count == 2 {
-                        hb.ema_interval_ms = interval_ms;
-                        hb.ema_jitter_ms = 0.0;
-                    } else {
-                        let alpha = 0.25;
-                        hb.ema_interval_ms =
-                            alpha * interval_ms + (1.0 - alpha) * hb.ema_interval_ms;
-                        let jitter = (interval_ms - hb.ema_interval_ms).abs();
-                        hb.ema_jitter_ms = alpha * jitter + (1.0 - alpha) * hb.ema_jitter_ms;
-                    }
-                    hb.last_seen_utc = now;
+            let key = metrics_key(service_id, instance_id);
+            if let Some(mut hb) = self.metrics_heartbeat.get_mut(&key) {
+                let interval_ms = now
+                    .signed_duration_since(hb.last_seen_utc)
+                    .num_milliseconds()
+                    .max(1) as f64;
+                hb.sample_count += 1;
+                if hb.sample_count == 2 {
+                    hb.ema_interval_ms = interval_ms;
+                    hb.ema_jitter_ms = 0.0;
                 } else {
-                    self.metrics_heartbeat.insert(
-                        key,
-                        MetricsHeartbeatState {
-                            last_seen_utc: now,
-                            sample_count: 1,
-                            ema_interval_ms: 0.0,
-                            ema_jitter_ms: 0.0,
-                        },
-                    );
+                    let alpha = 0.25;
+                    hb.ema_interval_ms = alpha * interval_ms + (1.0 - alpha) * hb.ema_interval_ms;
+                    let jitter = (interval_ms - hb.ema_interval_ms).abs();
+                    hb.ema_jitter_ms = alpha * jitter + (1.0 - alpha) * hb.ema_jitter_ms;
                 }
+                hb.last_seen_utc = now;
+            } else {
+                self.metrics_heartbeat.insert(
+                    key,
+                    MetricsHeartbeatState {
+                        last_seen_utc: now,
+                        sample_count: 1,
+                        ema_interval_ms: 0.0,
+                        ema_jitter_ms: 0.0,
+                    },
+                );
             }
         }
     }
 
-    /// Recomputes instance health from metrics heartbeat recency and regularity.
+    /// Recomputes instance health from metrics, heartbeat recency and regularity.
     ///
     /// - `Down` when heartbeat stops beyond timeout
     /// - `Degraded` when heartbeat becomes irregular (high jitter)
@@ -241,35 +240,50 @@ impl ServiceRegistry {
         for mut service in self.services.iter_mut() {
             for instance in service.instances.values_mut() {
                 let key = metrics_key(&instance.service_id, &instance.instance_id);
-                let Some(hb) = self.metrics_heartbeat.get(&key) else {
-                    // No metrics observed yet for this instance.
-                    instance.status = InstanceStatus::Down;
-                    continue;
-                };
-
-                let silent_ms = now
-                    .signed_duration_since(hb.last_seen_utc)
-                    .num_milliseconds()
-                    .max(0) as f64;
-
-                if silent_ms > timeout_ms {
-                    instance.status = InstanceStatus::Down;
-                    continue;
-                }
-
-                let has_stable_baseline = hb.sample_count >= 5 && hb.ema_interval_ms > 0.0;
-                if has_stable_baseline {
-                    let jitter_ratio = hb.ema_jitter_ms / hb.ema_interval_ms;
-                    let cadence_gap_ratio = silent_ms / hb.ema_interval_ms;
-                    if jitter_ratio >= 0.4 || cadence_gap_ratio >= 2.5 {
-                        instance.status = InstanceStatus::Degraded;
-                        continue;
-                    }
-                }
-
-                instance.status = InstanceStatus::Up;
+                let heartbeat = self.metrics_heartbeat.get(&key).map(|hb| *hb.value());
+                instance.status =
+                    Self::evaluate_instance_metrics_health(now, timeout_ms, heartbeat);
             }
         }
+    }
+
+    fn evaluate_instance_metrics_health(
+        now: chrono::DateTime<Utc>,
+        timeout_ms: f64,
+        heartbeat: Option<MetricsHeartbeatState>,
+    ) -> InstanceStatus {
+        let Some(heartbeat) = heartbeat else {
+            // No metrics observed yet for this instance.
+            return InstanceStatus::Down;
+        };
+
+        let silent_ms = Self::calculate_silent_ms(now, heartbeat);
+        if silent_ms > timeout_ms {
+            return InstanceStatus::Down;
+        }
+
+        if Self::is_irregular_heartbeat(heartbeat, silent_ms) {
+            return InstanceStatus::Degraded;
+        }
+
+        InstanceStatus::Up
+    }
+
+    fn calculate_silent_ms(now: chrono::DateTime<Utc>, heartbeat: MetricsHeartbeatState) -> f64 {
+        now.signed_duration_since(heartbeat.last_seen_utc)
+            .num_milliseconds()
+            .max(0) as f64
+    }
+
+    fn is_irregular_heartbeat(heartbeat: MetricsHeartbeatState, silent_ms: f64) -> bool {
+        let has_stable_baseline = heartbeat.sample_count >= 5 && heartbeat.ema_interval_ms > 0.0;
+        if !has_stable_baseline {
+            return false;
+        }
+
+        let jitter_ratio = heartbeat.ema_jitter_ms / heartbeat.ema_interval_ms;
+        let cadence_gap_ratio = silent_ms / heartbeat.ema_interval_ms;
+        jitter_ratio >= 0.4 || cadence_gap_ratio >= 2.5
     }
 
     /// Returns a snapshot of all known services.
@@ -289,11 +303,12 @@ impl ServiceRegistry {
         instance_id: &str,
         token: &str,
     ) -> bool {
-        if let Some(service) = self.services.get(service_id) {
-            if let Some(instance) = service.instances.get(instance_id) {
-                return instance.token == token;
-            }
+        if let Some(service) = self.services.get(service_id)
+            && let Some(instance) = service.instances.get(instance_id)
+        {
+            return instance.token == token;
         }
+
         false
     }
 
@@ -355,18 +370,18 @@ impl ServiceRegistry {
         instance_id: &str,
         status: InstanceStatus,
     ) {
-        if let Some(mut service) = self.services.get_mut(service_id) {
-            if let Some(instance) = service.instances.get_mut(instance_id) {
-                instance.status = status;
-                info!(
-                    service_id = %service_id,
-                    instance_id = %instance_id,
-                    status = ?status,
-                    "registry instance status updated"
-                );
-                if status == InstanceStatus::Up {
-                    instance.last_heartbeat_utc = Utc::now();
-                }
+        if let Some(mut service) = self.services.get_mut(service_id)
+            && let Some(instance) = service.instances.get_mut(instance_id)
+        {
+            instance.status = status;
+            info!(
+                service_id = %service_id,
+                instance_id = %instance_id,
+                status = ?status,
+                "registry instance status updated"
+            );
+            if status == InstanceStatus::Up {
+                instance.last_heartbeat_utc = Utc::now();
             }
         }
     }

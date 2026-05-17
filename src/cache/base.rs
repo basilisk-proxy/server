@@ -1,7 +1,7 @@
 use super::in_memory::InMemoryCacheManager;
 use super::memcached::MemcachedCacheManager;
 use super::redis::RedisCacheManager;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Provider-agnostic cache strategy surface.
 ///
@@ -170,17 +170,16 @@ pub(super) fn apply_sort_options(mut values: Vec<String>, options: &str) -> Vec<
     if let Some(index) = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("LIMIT"))
-    {
-        if let (Some(offset), Some(count)) = (
+        && let (Some(offset), Some(count)) = (
             tokens
                 .get(index + 1)
                 .and_then(|value| value.parse::<usize>().ok()),
             tokens
                 .get(index + 2)
                 .and_then(|value| value.parse::<usize>().ok()),
-        ) {
-            values = values.into_iter().skip(offset).take(count).collect();
-        }
+        )
+    {
+        values = values.into_iter().skip(offset).take(count).collect();
     }
 
     values

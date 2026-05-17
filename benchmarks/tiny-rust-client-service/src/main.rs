@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::{Router, routing::get};
+use axum::{Router, body::Bytes, routing::get, routing::post};
 use rust_client::{BasiliskClient, BasiliskClientConfig};
 use std::{env, net::SocketAddr};
 use tokio::time::{Duration, sleep};
@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/bench/ping", get(|| async { "pong" }))
+        .route("/bench/echo", post(|body: Bytes| async move { body }))
         .with_state(basilisk_client);
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((

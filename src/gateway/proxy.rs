@@ -7,16 +7,27 @@ use axum::extract::ConnectInfo;
 use axum::{
     body::Body,
     extract::{Request, State},
+    http::HeaderMap,
+    http::HeaderName,
+    http::HeaderValue,
+    http::Request as HttpRequest,
     http::Response,
     http::StatusCode,
+    http::Version,
+    http::header::CONNECTION,
+    http::header::CONTENT_LENGTH,
     response::IntoResponse,
 };
 use dashmap::DashMap;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::TokioExecutor;
+use smallvec::SmallVec;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
@@ -24,6 +35,27 @@ const ROUTE_CACHE_NAMESPACE: &str = "route-resolution";
 const ROUTE_CACHE_MISS_SENTINEL: &str = "__basilisk:miss__";
 const PROXY_HOP_COUNT_HEADER: &str = "x-basilisk-proxy-hop";
 const MAX_PROXY_HOPS: u8 = 3;
+const MAX_PROXY_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
+pub type UpstreamHttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+type ForwardOutcome = (Response<Body>, Option<String>, f64, f64);
+
+/// Builds a shared Hyper client for upstream forwarding.
+///
+/// Reusing a single client enables TCP/TLS connection pooling and avoids
+/// rebuilding the connection state for every proxied request.
+pub fn new_upstream_http_client() -> UpstreamHttpClient {
+    let https_connector = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(64)
+        .build(https_connector)
+}
 
 pub struct ProxyHandler {
     counters: DashMap<String, AtomicUsize>,
@@ -84,7 +116,11 @@ impl ProxyHandler {
 
         let (mut response, mut error_message, mut metrics) =
             if let Some(reject) = middleware_result.short_circuit_response {
-                (Self::to_response(reject), None, HashMap::new())
+                (
+                    Self::convert_middleware_to_response(reject),
+                    None,
+                    HashMap::new(),
+                )
             } else {
                 Self::proxy_to_upstream(
                     Arc::clone(&state),
@@ -132,7 +168,9 @@ impl ProxyHandler {
             &connection_info,
             &after_context,
         ) {
-            Ok(Some(after_response)) => response = Self::to_response(after_response),
+            Ok(Some(after_response)) => {
+                response = Self::convert_middleware_to_response(after_response)
+            }
             Ok(None) => {}
             Err(err) => tracing::error!("Lua after middleware execution failed: {}", err),
         }
@@ -249,6 +287,7 @@ impl ProxyHandler {
         }
 
         let (response, error_message, send_ms, body_ms) = Self::forward_request(
+            &state.upstream_client,
             target_uri,
             req,
             remote_ip,
@@ -263,7 +302,7 @@ impl ProxyHandler {
         (response, error_message, metrics)
     }
 
-    fn to_response(middleware_response: MiddlewareResponse) -> Response<Body> {
+    fn convert_middleware_to_response(middleware_response: MiddlewareResponse) -> Response<Body> {
         let mut builder = Response::builder().status(
             StatusCode::from_u16(middleware_response.status)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -306,8 +345,9 @@ impl ProxyHandler {
 
         let resolved = state.registry.resolve_service_by_path(path);
         let cached_value = resolved
-            .clone()
-            .unwrap_or_else(|| ROUTE_CACHE_MISS_SENTINEL.to_string());
+            .as_deref()
+            .unwrap_or(ROUTE_CACHE_MISS_SENTINEL)
+            .to_string();
 
         if let Err(err) = state.cache.internal_hash_set_with_ttl(
             &route_cache_key,
@@ -328,7 +368,7 @@ impl ProxyHandler {
         service_id: &str,
         service: &'a ServiceDefinition,
     ) -> Result<&'a ServiceInstance, (StatusCode, &'static str)> {
-        let healthy_instances: Vec<_> = service
+        let healthy_instances: SmallVec<[&ServiceInstance; 8]> = service
             .instances
             .values()
             .filter(|i| i.status == InstanceStatus::Up)
@@ -341,8 +381,12 @@ impl ProxyHandler {
             ));
         }
 
-        let strategy = &state.config.routing.default_load_balancing_strategy;
-        let target_instance = match strategy.as_str() {
+        let strategy = state
+            .config
+            .routing
+            .default_load_balancing_strategy
+            .as_str();
+        let target_instance = match strategy {
             "WEIGHTED_ROUND_ROBIN" => {
                 self.pick_weighted_round_robin(state, service_id, &healthy_instances)
             }
@@ -360,44 +404,64 @@ impl ProxyHandler {
         instance: &ServiceInstance,
     ) -> String {
         let mut final_path = path;
-        if state.config.routing.strip_prefix {
-            if let Some(prefix) = service.path_prefixes.iter().find(|p| path.starts_with(*p)) {
-                final_path = &path[prefix.len()..];
-            }
+        if state.config.routing.strip_prefix
+            && let Some(prefix) = service.path_prefixes.iter().find(|p| path.starts_with(*p))
+        {
+            final_path = &path[prefix.len()..];
         }
         let stripped = final_path.strip_prefix('/').unwrap_or(final_path);
-        format!("{}/{}", instance.to_uri(), stripped)
+        let base_uri = instance.to_uri();
+        let mut target = String::with_capacity(base_uri.len() + 1 + stripped.len());
+        target.push_str(&base_uri);
+        target.push('/');
+        target.push_str(stripped);
+        target
     }
 
     async fn forward_request(
+        client: &UpstreamHttpClient,
         target_uri: String,
         req: Request,
         remote_ip: &str,
         remote_port: u16,
         forward_headers: HashMap<String, String>,
         telemetry: Arc<crate::observability::RuntimeTelemetry>,
-    ) -> (Response<Body>, Option<String>, f64, f64) {
-        let client = reqwest::Client::new();
+    ) -> ForwardOutcome {
         let (parts, body) = req.into_parts();
 
-        let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-            Ok(b) => b,
-            Err(_) => {
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-                    Some("request payload too large".to_string()),
-                    0.0,
-                    0.0,
-                );
-            }
+        let (forwarded_for, next_hop_count) = match Self::prepare_forwarding_metadata(
+            &parts.headers,
+            &target_uri,
+            remote_ip,
+            remote_port,
+        ) {
+            Ok(metadata) => metadata,
+            Err(outcome) => return outcome,
         };
 
-        let mut proxy_req = client
-            .request(parts.method.clone(), &target_uri)
-            .body(body_bytes);
+        let proxy_req = match Self::build_upstream_request(
+            parts,
+            body,
+            &target_uri,
+            remote_port,
+            &forwarded_for,
+            next_hop_count,
+            forward_headers,
+        ) {
+            Ok(req) => req,
+            Err(outcome) => return outcome,
+        };
 
-        let incoming_hop_count =
-            header_to_u8(parts.headers.get(PROXY_HOP_COUNT_HEADER)).unwrap_or(0);
+        Self::dispatch_upstream_request(client, proxy_req, telemetry).await
+    }
+
+    fn prepare_forwarding_metadata(
+        headers: &HeaderMap,
+        target_uri: &str,
+        remote_ip: &str,
+        remote_port: u16,
+    ) -> Result<(String, u8), ForwardOutcome> {
+        let incoming_hop_count = header_to_u8(headers.get(PROXY_HOP_COUNT_HEADER)).unwrap_or(0);
         if incoming_hop_count >= MAX_PROXY_HOPS {
             tracing::warn!(
                 target_uri = %target_uri,
@@ -407,56 +471,134 @@ impl ProxyHandler {
                 max_proxy_hops = MAX_PROXY_HOPS,
                 "Proxy loop detected; rejecting request"
             );
-            return (
-                StatusCode::LOOP_DETECTED.into_response(),
-                Some(format!(
-                    "proxy loop detected after {} hops",
-                    incoming_hop_count
-                )),
-                0.0,
-                0.0,
-            );
+            return Err(Self::forward_error(
+                StatusCode::LOOP_DETECTED,
+                format!("proxy loop detected after {} hops", incoming_hop_count),
+            ));
         }
 
-        let forwarded_for =
-            build_forwarded_for_header(parts.headers.get("x-forwarded-for"), remote_ip);
+        if let Some(content_length) = header_to_u64(headers.get(CONTENT_LENGTH))
+            && content_length > MAX_PROXY_REQUEST_BODY_BYTES
+        {
+            return Err(Self::forward_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request payload too large".to_string(),
+            ));
+        }
+
+        let forwarded_for = build_forwarded_for_header(headers.get("x-forwarded-for"), remote_ip);
         let next_hop_count = incoming_hop_count.saturating_add(1);
+        Ok((forwarded_for, next_hop_count))
+    }
 
-        proxy_req = proxy_req
-            .header("X-Forwarded-For", forwarded_for)
-            .header("X-Forwarded-Port", remote_port.to_string())
-            .header(PROXY_HOP_COUNT_HEADER, next_hop_count.to_string());
+    fn build_upstream_request(
+        parts: axum::http::request::Parts,
+        body: Body,
+        target_uri: &str,
+        remote_port: u16,
+        forwarded_for: &str,
+        next_hop_count: u8,
+        forward_headers: HashMap<String, String>,
+    ) -> Result<HttpRequest<Body>, ForwardOutcome> {
+        let mut proxy_req_builder = HttpRequest::builder()
+            .method(parts.method)
+            .uri(target_uri)
+            .version(normalize_upstream_http_version(parts.version));
 
-        for (name, value) in parts.headers.iter() {
+        let headers = match proxy_req_builder.headers_mut() {
+            Some(headers) => headers,
+            None => {
+                return Err(Self::forward_error(
+                    StatusCode::BAD_GATEWAY,
+                    "failed to prepare upstream request headers".to_string(),
+                ));
+            }
+        };
+
+        Self::insert_forwarding_headers(headers, forwarded_for, remote_port, next_hop_count);
+        Self::copy_request_headers(headers, &parts.headers);
+        Self::apply_middleware_forward_headers(headers, forward_headers);
+
+        proxy_req_builder.body(body).map_err(|err| {
+            Self::forward_error(
+                StatusCode::BAD_GATEWAY,
+                format!("failed to build upstream request: {err}"),
+            )
+        })
+    }
+
+    fn insert_forwarding_headers(
+        headers: &mut HeaderMap,
+        forwarded_for: &str,
+        remote_port: u16,
+        next_hop_count: u8,
+    ) {
+        if let Ok(value) = HeaderValue::from_str(forwarded_for) {
+            headers.insert(HeaderName::from_static("x-forwarded-for"), value);
+        }
+        if let Ok(value) = HeaderValue::from_str(&remote_port.to_string()) {
+            headers.insert(HeaderName::from_static("x-forwarded-port"), value);
+        }
+        if let Ok(value) = HeaderValue::from_str(&next_hop_count.to_string()) {
+            headers.insert(HeaderName::from_static(PROXY_HOP_COUNT_HEADER), value);
+        }
+    }
+
+    fn copy_request_headers(target_headers: &mut HeaderMap, source_headers: &HeaderMap) {
+        for (name, value) in source_headers {
             if name != "host"
                 && !is_hop_by_hop_header(name.as_str())
                 && name != "x-forwarded-for"
                 && name != "x-forwarded-port"
                 && name != PROXY_HOP_COUNT_HEADER
             {
-                proxy_req = proxy_req.header(name, value);
+                target_headers.append(name, value.clone());
             }
         }
+    }
 
-        // Apply forward headers from middleware
-        for (name, value) in forward_headers.iter() {
-            proxy_req = proxy_req.header(name, value);
+    fn apply_middleware_forward_headers(
+        headers: &mut HeaderMap,
+        forward_headers: HashMap<String, String>,
+    ) {
+        for (name, value) in forward_headers {
+            let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                tracing::warn!(header = %name, "skipping invalid middleware forward header name");
+                continue;
+            };
+            let Ok(header_value) = HeaderValue::from_str(&value) else {
+                tracing::warn!(header = %name, "skipping invalid middleware forward header value");
+                continue;
+            };
+            headers.insert(header_name, header_value);
         }
+    }
 
+    async fn dispatch_upstream_request(
+        client: &UpstreamHttpClient,
+        proxy_req: HttpRequest<Body>,
+        telemetry: Arc<crate::observability::RuntimeTelemetry>,
+    ) -> ForwardOutcome {
         let send_started = Instant::now();
-        match proxy_req.send().await {
+        match client.request(proxy_req).await {
             Ok(resp) => {
                 let send_elapsed = send_started.elapsed();
                 telemetry.record_proxy_latency("proxy.send_upstream_request", send_elapsed);
-                let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+
+                let (parts, body) = resp.into_parts();
+                let status = StatusCode::from_u16(parts.status.as_u16()).unwrap_or(StatusCode::OK);
                 let mut builder = axum::response::Response::builder().status(status);
-                for (name, value) in resp.headers().iter() {
-                    builder = builder.header(name, value);
+                for (name, value) in &parts.headers {
+                    if name != CONNECTION {
+                        builder = builder.header(name, value);
+                    }
                 }
+
                 let read_body_started = Instant::now();
-                let resp_body = Body::from(resp.bytes().await.unwrap_or_default());
+                let resp_body = Body::new(body);
                 let body_elapsed = read_body_started.elapsed();
                 telemetry.record_proxy_latency("proxy.wait_upstream_response_body", body_elapsed);
+
                 let err = if status.is_client_error() || status.is_server_error() {
                     Some(format!(
                         "upstream responded with status {}",
@@ -465,6 +607,7 @@ impl ProxyHandler {
                 } else {
                     None
                 };
+
                 (
                     builder
                         .body(resp_body)
@@ -474,18 +617,22 @@ impl ProxyHandler {
                     duration_to_ms(body_elapsed),
                 )
             }
-            Err(e) => {
+            Err(err) => {
                 let send_elapsed = send_started.elapsed();
                 telemetry.record_proxy_latency("proxy.send_upstream_request", send_elapsed);
-                tracing::error!("Proxy error: {}", e);
+                tracing::error!("Proxy error: {}", err);
                 (
                     StatusCode::BAD_GATEWAY.into_response(),
-                    Some(e.to_string()),
+                    Some(err.to_string()),
                     duration_to_ms(send_elapsed),
                     0.0,
                 )
             }
         }
+    }
+
+    fn forward_error(status: StatusCode, message: String) -> ForwardOutcome {
+        (status.into_response(), Some(message), 0.0, 0.0)
     }
 
     fn pick_round_robin<'a>(
@@ -497,11 +644,10 @@ impl ProxyHandler {
         if let Ok(counter) = state
             .cache
             .internal_incr(&format!("balancer:rr:{service_id}"), 1)
+            && counter > 0
         {
-            if counter > 0 {
-                let index = (counter.saturating_sub(1) as usize) % instances.len();
-                return instances[index];
-            }
+            let index = (counter.saturating_sub(1) as usize) % instances.len();
+            return instances[index];
         }
 
         let counter = self
@@ -580,68 +726,85 @@ fn duration_to_ms(duration: std::time::Duration) -> f64 {
 /// own listening address. Handles hostname resolution so that `localhost`, `127.0.0.1`,
 /// `::1`, and `0.0.0.0` are all treated as equivalent to the loopback / any interface.
 fn is_self_routing(target_uri: &str, gateway_addr: SocketAddr) -> bool {
-    // Parse scheme://host[:port]/path from the target URI.
-    let without_scheme = if let Some(rest) = target_uri
-        .strip_prefix("http://")
-        .or_else(|| target_uri.strip_prefix("https://"))
-    {
-        rest
-    } else {
+    let Some((target_host, target_port)) = parse_target_host_and_port(target_uri) else {
         return false;
     };
 
-    // Extract host:port (authority portion before the first '/').
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
-
-    // Parse port: default 80 for http, 443 for https.
-    let default_port: u16 = if target_uri.starts_with("https://") {
-        443
-    } else {
-        80
-    };
-
-    let (target_host, target_port) = if let Some(colon) = authority.rfind(':') {
-        let host = &authority[..colon];
-        let port = authority[colon + 1..]
-            .parse::<u16>()
-            .unwrap_or(default_port);
-        (host, port)
-    } else {
-        (authority, default_port)
-    };
-
-    // Port must match first — cheap check.
     if target_port != gateway_addr.port() {
         return false;
     }
 
-    // Resolve target hostname to IP(s) and check if any match the gateway IP.
-    // Special-case common loopback aliases to avoid DNS for the critical path.
-    let gateway_ip = gateway_addr.ip().to_canonical();
-
-    let target_ips: Vec<IpAddr> = match target_host {
-        "localhost" => vec![
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ],
-        _ => {
-            // Use DNS resolution for other hostnames.
-            match format!("{target_host}:0").to_socket_addrs() {
-                Ok(addrs) => addrs.map(|a| a.ip().to_canonical()).collect(),
-                Err(_) => return false,
-            }
-        }
+    let target_ips = match resolve_target_ips(target_host) {
+        Some(ips) => ips,
+        None => return false,
     };
 
+    let gateway_ip = gateway_addr.ip().to_canonical();
+    matches_gateway_address(gateway_ip, &target_ips)
+}
+
+fn parse_target_host_and_port(target_uri: &str) -> Option<(&str, u16)> {
+    let (without_scheme, default_port) = parse_uri_authority_input(target_uri)?;
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    Some(split_authority_host_and_port(authority, default_port))
+}
+
+fn parse_uri_authority_input(target_uri: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = target_uri.strip_prefix("http://") {
+        return Some((rest, 80));
+    }
+    if let Some(rest) = target_uri.strip_prefix("https://") {
+        return Some((rest, 443));
+    }
+    None
+}
+
+fn split_authority_host_and_port(authority: &str, default_port: u16) -> (&str, u16) {
+    if let Some(stripped) = authority.strip_prefix('[')
+        && let Some(end_bracket) = stripped.find(']')
+    {
+        let host = &stripped[..end_bracket];
+        let port = stripped[end_bracket + 1..]
+            .strip_prefix(':')
+            .and_then(|raw| raw.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return (host, port);
+    }
+
+    if let Some(colon) = authority.rfind(':') {
+        let host = &authority[..colon];
+        let port = authority[colon + 1..]
+            .parse::<u16>()
+            .unwrap_or(default_port);
+        return (host, port);
+    }
+
+    (authority, default_port)
+}
+
+fn resolve_target_ips(target_host: &str) -> Option<Vec<IpAddr>> {
+    if target_host.eq_ignore_ascii_case("localhost") {
+        return Some(vec![
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ]);
+    }
+
+    format!("{target_host}:0")
+        .to_socket_addrs()
+        .ok()
+        .map(|addrs| addrs.map(|a| a.ip().to_canonical()).collect())
+}
+
+fn matches_gateway_address(gateway_ip: IpAddr, target_ips: &[IpAddr]) -> bool {
     let gateway_is_any = gateway_ip == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         || gateway_ip == IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
 
-    for ip in &target_ips {
+    for ip in target_ips {
         let ip = ip.to_canonical();
         if ip == gateway_ip {
             return true;
         }
-        // If gateway binds to 0.0.0.0 / ::, any loopback or local address counts.
         if gateway_is_any
             && (ip.is_loopback()
                 || ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -655,34 +818,47 @@ fn is_self_routing(target_uri: &str, gateway_addr: SocketAddr) -> bool {
 }
 
 fn is_hop_by_hop_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "content-length"
-    )
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("content-length")
 }
 
-fn build_forwarded_for_header(
-    existing: Option<&axum::http::HeaderValue>,
-    remote_ip: &str,
-) -> String {
+fn build_forwarded_for_header(existing: Option<&HeaderValue>, remote_ip: &str) -> String {
     match existing.and_then(|v| v.to_str().ok()).map(str::trim) {
-        Some(existing) if !existing.is_empty() => format!("{existing}, {remote_ip}"),
+        Some(existing) if !existing.is_empty() => {
+            let mut value = String::with_capacity(existing.len() + 2 + remote_ip.len());
+            value.push_str(existing);
+            value.push_str(", ");
+            value.push_str(remote_ip);
+            value
+        }
         _ => remote_ip.to_string(),
     }
 }
 
-fn header_to_u8(value: Option<&axum::http::HeaderValue>) -> Option<u8> {
+fn header_to_u8(value: Option<&HeaderValue>) -> Option<u8> {
     value
         .and_then(|v| v.to_str().ok())
         .and_then(|raw| raw.trim().parse::<u8>().ok())
+}
+
+fn header_to_u64(value: Option<&HeaderValue>) -> Option<u64> {
+    value
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+}
+
+fn normalize_upstream_http_version(version: Version) -> Version {
+    match version {
+        Version::HTTP_09 | Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2 => version,
+        _ => Version::HTTP_11,
+    }
 }
 
 #[cfg(test)]
@@ -715,6 +891,7 @@ mod tests {
             proxy_handler,
             lua_runtime: LuaRuntime::allow_all(),
             cache: Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init")),
+            upstream_client: new_upstream_http_client(),
             telemetry: Arc::new(RuntimeTelemetry::new()),
         })
     }
@@ -833,7 +1010,7 @@ mod tests {
         // Mark the instance Up so it would normally be eligible.
         state
             .registry
-            .update_instance_status("loopy", "loopy-1", crate::models::InstanceStatus::Up)
+            .update_instance_status("loopy", "loopy-1", InstanceStatus::Up)
             .await;
 
         let connect_info = SocketAddr::from(([127, 0, 0, 1], 54321));
@@ -869,5 +1046,45 @@ mod tests {
 
         let valid = HeaderValue::from_static("7");
         assert_eq!(header_to_u8(Some(&valid)), Some(7));
+    }
+
+    #[test]
+    fn content_length_parser_ignores_invalid_values() {
+        let invalid = HeaderValue::from_static("not-a-number");
+        assert_eq!(header_to_u64(Some(&invalid)), None);
+
+        let valid = HeaderValue::from_static("1048576");
+        assert_eq!(header_to_u64(Some(&valid)), Some(1_048_576));
+    }
+
+    #[tokio::test]
+    async fn forward_request_rejects_known_oversized_content_length() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(
+                CONTENT_LENGTH,
+                (MAX_PROXY_REQUEST_BODY_BYTES + 1).to_string(),
+            )
+            .body(Body::empty())
+            .expect("request build");
+
+        let telemetry = Arc::new(RuntimeTelemetry::new());
+        let client = new_upstream_http_client();
+        let (response, error, send_ms, body_ms) = ProxyHandler::forward_request(
+            &client,
+            "http://127.0.0.1:1/upload".to_string(),
+            request,
+            "127.0.0.1",
+            50000,
+            HashMap::new(),
+            telemetry,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.as_deref(), Some("request payload too large"));
+        assert_eq!(send_ms, 0.0);
+        assert_eq!(body_ms, 0.0);
     }
 }

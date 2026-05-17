@@ -13,7 +13,9 @@ axum = "0.8.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6.1.0"
-reqwest = { version = "0.13.3", features = ["json"] }
+hyper = { version = "1.9.0", features = ["http1", "http2", "client"] }
+hyper-util = { version = "0.1.10", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27.5", features = ["http1", "http2", "webpki-roots"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 rand = "0.10.1"
@@ -21,3 +23,4 @@ mlua = { version = "0.11.6", features = ["vendored", "send", "luajit"] }
 base64 = "0.22"
 redis = "1.2.1"
 memcache = "0.19.0"
+smallvec = "1.15.1"

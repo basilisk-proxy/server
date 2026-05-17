@@ -1,0 +1,23 @@
+{
+  "metrics": {
+    "http_reqs": {
+      "values": {
+        "count": 1920,
+        "rate": 320.0
+      }
+    },
+    "checks": {
+      "values": {
+        "rate": 0.998
+      }
+    },
+    "http_req_duration": {
+      "values": {
+        "avg": 7.2,
+        "med": 6.3,
+        "p(95)": 12.4,
+        "p(99)": 20.1
+      }
+    }
+  }
+}
