@@ -37,6 +37,27 @@ struct MiddlewareMount {
     handler_key: RegistryKey,
 }
 
+struct PrimitiveContext {
+    config: Arc<Mutex<GatewayConfig>>,
+    cache: Arc<GatewayCache>,
+    registry: Arc<ServiceRegistry>,
+    connection_manager: Arc<ConnectionManager>,
+    before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    registration_allowlist_rules: Arc<Mutex<Vec<RegistryKey>>>,
+    event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
+}
+
+struct MiddlewareExecutionInput<'a> {
+    path: &'a str,
+    method: &'a str,
+    headers: &'a HeaderMap,
+    host: &'a str,
+    connection_info: &'a RequestConnectionInfo,
+    after_context: Option<&'a AfterMiddlewareContext>,
+    shared_context: &'a Table,
+}
+
 enum MiddlewareMatcher {
     Any,
     Predicate(RegistryKey),
@@ -132,18 +153,18 @@ pub fn load_config_and_runtime(
     let event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    register_primitives(
-        &lua,
-        Arc::clone(&config_state),
-        Arc::clone(&cache),
-        Arc::clone(&registry),
-        Arc::clone(&connection_manager),
-        Arc::clone(&before_middleware_mounts),
-        Arc::clone(&after_middleware_mounts),
-        Arc::clone(&registration_allowlist_rules),
-        Arc::clone(&event_handlers),
-    )
-    .map_err(lua_to_anyhow)?;
+    let primitive_context = PrimitiveContext {
+        config: Arc::clone(&config_state),
+        cache: Arc::clone(&cache),
+        registry: Arc::clone(&registry),
+        connection_manager: Arc::clone(&connection_manager),
+        before_middleware_mounts: Arc::clone(&before_middleware_mounts),
+        after_middleware_mounts: Arc::clone(&after_middleware_mounts),
+        registration_allowlist_rules: Arc::clone(&registration_allowlist_rules),
+        event_handlers: Arc::clone(&event_handlers),
+    };
+
+    register_primitives(&lua, &primitive_context).map_err(lua_to_anyhow)?;
 
     let loaded_files = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
     let include_root = root.clone();
@@ -366,18 +387,18 @@ impl LuaRuntime {
                 continue;
             }
 
-            let (response, forward_headers) = execute_middleware(
-                &lua,
-                mount,
+            let input = MiddlewareExecutionInput {
                 path,
                 method,
                 headers,
-                &host,
+                host: &host,
                 connection_info,
-                None,
-                &shared_context,
-            )
-            .map_err(lua_to_anyhow)?;
+                after_context: None,
+                shared_context: &shared_context,
+            };
+
+            let (response, forward_headers) =
+                execute_middleware(&lua, mount, &input).map_err(lua_to_anyhow)?;
 
             // Accumulate forward headers
             accumulated_forward_headers.extend(forward_headers);
@@ -425,18 +446,17 @@ impl LuaRuntime {
                 continue;
             }
 
-            let (response, _) = execute_middleware(
-                &lua,
-                mount,
+            let input = MiddlewareExecutionInput {
                 path,
                 method,
                 headers,
-                &host,
+                host: &host,
                 connection_info,
-                Some(context),
-                &shared_context,
-            )
-            .map_err(lua_to_anyhow)?;
+                after_context: Some(context),
+                shared_context: &shared_context,
+            };
+
+            let (response, _) = execute_middleware(&lua, mount, &input).map_err(lua_to_anyhow)?;
 
             if response.is_some() {
                 current_response = response;
@@ -469,13 +489,7 @@ fn middleware_applies(
 fn execute_middleware(
     lua: &Lua,
     mount: &MiddlewareMount,
-    path: &str,
-    method: &str,
-    headers: &HeaderMap,
-    host: &str,
-    connection_info: &RequestConnectionInfo,
-    after_context: Option<&AfterMiddlewareContext>,
-    shared_context: &Table,
+    input: &MiddlewareExecutionInput<'_>,
 ) -> LuaResult<(Option<MiddlewareResponse>, HashMap<String, String>)> {
     let state = Arc::new(Mutex::new(MiddlewareExecutionState {
         next_called: false,
@@ -485,18 +499,8 @@ fn execute_middleware(
         body: String::new(),
         ended: false,
     }));
-    let req = build_req_table(
-        lua,
-        path,
-        method,
-        headers,
-        host,
-        connection_info,
-        after_context,
-        shared_context,
-        Arc::clone(&state),
-    )?;
-    let res = build_res_table(lua, Arc::clone(&state), after_context)?;
+    let req = build_req_table(lua, input, Arc::clone(&state))?;
+    let res = build_res_table(lua, Arc::clone(&state), input.after_context)?;
 
     let next_state = Arc::clone(&state);
     let next_fn = lua.create_function(move |_, ()| {
@@ -512,31 +516,28 @@ fn execute_middleware(
 
 fn build_req_table(
     lua: &Lua,
-    path: &str,
-    method: &str,
-    headers: &HeaderMap,
-    host: &str,
-    connection_info: &RequestConnectionInfo,
-    after_context: Option<&AfterMiddlewareContext>,
-    shared_context: &Table,
+    input: &MiddlewareExecutionInput<'_>,
     state: Arc<Mutex<MiddlewareExecutionState>>,
 ) -> LuaResult<Table> {
     let req = lua.create_table()?;
-    req.set("path", path)?;
-    req.set("method", method)?;
+    req.set("path", input.path)?;
+    req.set("method", input.method)?;
 
     let lua_headers = lua.create_table()?;
-    set_headers(headers, &lua_headers)?;
+    set_headers(input.headers, &lua_headers)?;
     req.set("headers", lua_headers)?;
-    req.set("host", host)?;
-    set_remote_info(lua, &req, headers, connection_info)?;
-    match after_context.and_then(|ctx| ctx.error_message.as_deref()) {
+    req.set("host", input.host)?;
+    set_remote_info(lua, &req, input.headers, input.connection_info)?;
+    match input
+        .after_context
+        .and_then(|ctx| ctx.error_message.as_deref())
+    {
         Some(err) => req.set("err", err)?,
         None => req.set("err", Value::Nil)?,
     }
 
     // Use the shared context dictionary (passed from middleware lifecycle)
-    req.set("ctx", shared_context.clone())?;
+    req.set("ctx", input.shared_context.clone())?;
 
     let auth_state = Arc::clone(&state);
     req.set(
@@ -754,42 +755,50 @@ fn to_middleware_response_with_forward_headers(
     Ok((response, state.forward_headers.clone()))
 }
 
-fn register_primitives(
-    lua: &Lua,
-    config: Arc<Mutex<GatewayConfig>>,
-    cache: Arc<GatewayCache>,
-    registry: Arc<ServiceRegistry>,
-    connection_manager: Arc<ConnectionManager>,
-    before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
-    after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
-    registration_allowlist_rules: Arc<Mutex<Vec<RegistryKey>>>,
-    event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
-) -> LuaResult<()> {
+fn register_primitives(lua: &Lua, context: &PrimitiveContext) -> LuaResult<()> {
     let basilisk = lua.create_table()?;
 
-    basilisk.set("server", make_server_api(lua, Arc::clone(&config))?)?;
-    basilisk.set("gateway", make_gateway_api(lua, Arc::clone(&config))?)?;
-    basilisk.set("cache", make_cache_api(lua, Arc::clone(&config), cache)?)?;
+    basilisk.set("server", make_server_api(lua, Arc::clone(&context.config))?)?;
+    basilisk.set(
+        "gateway",
+        make_gateway_api(lua, Arc::clone(&context.config))?,
+    )?;
+    basilisk.set(
+        "cache",
+        make_cache_api(lua, Arc::clone(&context.config), Arc::clone(&context.cache))?,
+    )?;
     basilisk.set(
         "security",
         make_security_api(
             lua,
-            Arc::clone(&config),
-            Arc::clone(&registration_allowlist_rules),
+            Arc::clone(&context.config),
+            Arc::clone(&context.registration_allowlist_rules),
         )?,
     )?;
     basilisk.set(
         "observability",
-        make_observability_api(lua, Arc::clone(&config))?,
+        make_observability_api(lua, Arc::clone(&context.config))?,
     )?;
     basilisk.set(
         "service_bus",
-        make_service_bus_api(lua, Arc::clone(&config), connection_manager, event_handlers)?,
+        make_service_bus_api(
+            lua,
+            Arc::clone(&context.config),
+            Arc::clone(&context.connection_manager),
+            Arc::clone(&context.event_handlers),
+        )?,
     )?;
-    basilisk.set("registry", make_registry_api(lua, registry)?)?;
+    basilisk.set(
+        "registry",
+        make_registry_api(lua, Arc::clone(&context.registry))?,
+    )?;
     basilisk.set(
         "proxy",
-        make_proxy_api(lua, before_middleware_mounts, after_middleware_mounts)?,
+        make_proxy_api(
+            lua,
+            Arc::clone(&context.before_middleware_mounts),
+            Arc::clone(&context.after_middleware_mounts),
+        )?,
     )?;
 
     lua.globals().set("basilisk", basilisk)?;

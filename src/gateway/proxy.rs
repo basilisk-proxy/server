@@ -39,6 +39,12 @@ const MAX_PROXY_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
 pub type UpstreamHttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 type ForwardOutcome = (Response<Body>, Option<String>, f64, f64);
+type ForwardError = (StatusCode, String);
+
+struct ForwardingMetadata {
+    forwarded_for: String,
+    next_hop_count: u8,
+}
 
 /// Builds a shared Hyper client for upstream forwarding.
 ///
@@ -429,14 +435,14 @@ impl ProxyHandler {
     ) -> ForwardOutcome {
         let (parts, body) = req.into_parts();
 
-        let (forwarded_for, next_hop_count) = match Self::prepare_forwarding_metadata(
+        let metadata = match Self::prepare_forwarding_metadata(
             &parts.headers,
             &target_uri,
             remote_ip,
             remote_port,
         ) {
             Ok(metadata) => metadata,
-            Err(outcome) => return outcome,
+            Err(err) => return Self::forward_error(err.0, err.1),
         };
 
         let proxy_req = match Self::build_upstream_request(
@@ -444,12 +450,12 @@ impl ProxyHandler {
             body,
             &target_uri,
             remote_port,
-            &forwarded_for,
-            next_hop_count,
+            &metadata.forwarded_for,
+            metadata.next_hop_count,
             forward_headers,
         ) {
             Ok(req) => req,
-            Err(outcome) => return outcome,
+            Err(err) => return Self::forward_error(err.0, err.1),
         };
 
         Self::dispatch_upstream_request(client, proxy_req, telemetry).await
@@ -460,7 +466,7 @@ impl ProxyHandler {
         target_uri: &str,
         remote_ip: &str,
         remote_port: u16,
-    ) -> Result<(String, u8), ForwardOutcome> {
+    ) -> Result<ForwardingMetadata, ForwardError> {
         let incoming_hop_count = header_to_u8(headers.get(PROXY_HOP_COUNT_HEADER)).unwrap_or(0);
         if incoming_hop_count >= MAX_PROXY_HOPS {
             tracing::warn!(
@@ -471,7 +477,7 @@ impl ProxyHandler {
                 max_proxy_hops = MAX_PROXY_HOPS,
                 "Proxy loop detected; rejecting request"
             );
-            return Err(Self::forward_error(
+            return Err((
                 StatusCode::LOOP_DETECTED,
                 format!("proxy loop detected after {} hops", incoming_hop_count),
             ));
@@ -480,7 +486,7 @@ impl ProxyHandler {
         if let Some(content_length) = header_to_u64(headers.get(CONTENT_LENGTH))
             && content_length > MAX_PROXY_REQUEST_BODY_BYTES
         {
-            return Err(Self::forward_error(
+            return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request payload too large".to_string(),
             ));
@@ -488,7 +494,10 @@ impl ProxyHandler {
 
         let forwarded_for = build_forwarded_for_header(headers.get("x-forwarded-for"), remote_ip);
         let next_hop_count = incoming_hop_count.saturating_add(1);
-        Ok((forwarded_for, next_hop_count))
+        Ok(ForwardingMetadata {
+            forwarded_for,
+            next_hop_count,
+        })
     }
 
     fn build_upstream_request(
@@ -499,7 +508,7 @@ impl ProxyHandler {
         forwarded_for: &str,
         next_hop_count: u8,
         forward_headers: HashMap<String, String>,
-    ) -> Result<HttpRequest<Body>, ForwardOutcome> {
+    ) -> Result<HttpRequest<Body>, ForwardError> {
         let mut proxy_req_builder = HttpRequest::builder()
             .method(parts.method)
             .uri(target_uri)
@@ -508,7 +517,7 @@ impl ProxyHandler {
         let headers = match proxy_req_builder.headers_mut() {
             Some(headers) => headers,
             None => {
-                return Err(Self::forward_error(
+                return Err((
                     StatusCode::BAD_GATEWAY,
                     "failed to prepare upstream request headers".to_string(),
                 ));
@@ -520,7 +529,7 @@ impl ProxyHandler {
         Self::apply_middleware_forward_headers(headers, forward_headers);
 
         proxy_req_builder.body(body).map_err(|err| {
-            Self::forward_error(
+            (
                 StatusCode::BAD_GATEWAY,
                 format!("failed to build upstream request: {err}"),
             )

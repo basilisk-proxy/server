@@ -1009,30 +1009,28 @@ end)
 
     let cm_responder = Arc::clone(&cm);
     let responder = tokio::spawn(async move {
-        if let Some(msg) = orders_rx.recv().await {
-            if msg.r#type == protocol_types::EVENT {
-                if let Some(event) = msg.event {
-                    if let Some(reply_to) = event.payload.get("reply_to").and_then(|v| v.as_str()) {
-                        let mut payload = HashMap::new();
-                        payload.insert("ok".to_string(), serde_json::json!(true));
-                        payload.insert("upstream".to_string(), serde_json::json!("orders"));
+        if let Some(msg) = orders_rx.recv().await
+            && msg.r#type == protocol_types::EVENT
+            && let Some(event) = msg.event
+            && let Some(reply_to) = event.payload.get("reply_to").and_then(|v| v.as_str())
+        {
+            let mut payload = HashMap::new();
+            payload.insert("ok".to_string(), serde_json::json!(true));
+            payload.insert("upstream".to_string(), serde_json::json!("orders"));
 
-                        let response_event = ServiceBusEventEnvelope {
-                            event_id: "evt-forward-response".to_string(),
-                            emitted_at_utc: Utc::now(),
-                            service_id: "orders".to_string(),
-                            instance_id: "orders-1".to_string(),
-                            topic: reply_to.to_string(),
-                            message_type: "order.reply".to_string(),
-                            correlation_id: event.correlation_id,
-                            causation_id: Some(event.event_id),
-                            payload,
-                        };
+            let response_event = ServiceBusEventEnvelope {
+                event_id: "evt-forward-response".to_string(),
+                emitted_at_utc: Utc::now(),
+                service_id: "orders".to_string(),
+                instance_id: "orders-1".to_string(),
+                topic: reply_to.to_string(),
+                message_type: "order.reply".to_string(),
+                correlation_id: event.correlation_id,
+                causation_id: Some(event.event_id),
+                payload,
+            };
 
-                        cm_responder.publish(response_event, None);
-                    }
-                }
-            }
+            cm_responder.publish(response_event, None);
         }
     });
 
