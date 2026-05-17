@@ -17,6 +17,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Checkout rust-client dependency repository
+        uses: actions/checkout@v4
+        with:
+          repository: basilisk-proxy/rust-client
+          path: rust-client-dependency
+
+      - name: Wire rust-client into expected relative path
+        run: |
+          ln -sfn "$GITHUB_WORKSPACE/rust-client-dependency" "$GITHUB_WORKSPACE/../rust-client"
+          test -d "$GITHUB_WORKSPACE/../rust-client"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 

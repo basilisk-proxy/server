@@ -6,7 +6,8 @@ COPY ../rust-client/src ./rust-client/src
 COPY ../proxy-server/benchmarks/tiny-rust-client-service/Cargo.toml ./proxy-server/benchmarks/tiny-rust-client-service/
 COPY ../proxy-server/benchmarks/tiny-rust-client-service/src ./proxy-server/benchmarks/tiny-rust-client-service/src
 
-RUN cargo build --release --manifest-path proxy-server/benchmarks/tiny-rust-client-service/Cargo.toml
+RUN CARGO_TARGET_DIR=/workspace/target \
+    cargo build --release --manifest-path proxy-server/benchmarks/tiny-rust-client-service/Cargo.toml
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
