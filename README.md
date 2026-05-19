@@ -856,27 +856,27 @@ direct, NGINX front, HAProxy front) run within Docker Compose on the same host.
 
 **Throughput (GET `/bench/ping`)**
 
-| Traffic path    | Req/s   | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
-|-----------------|---------|-----------|--------------|----------|----------|----------|
-| basilisk-direct | 5302.69 | 106079    | 100.00       | 4.23     | 2.80     | 11.75    |
-| haproxy-front   | 4439.73 | 88810     | 100.00       | 5.10     | 4.04     | 12.01    |
-| nginx-front     | 798.84  | 16026     | 100.00       | 30.60    | 13.43    | 157.45   |
+| Traffic path            | Req/s   | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
+|-------------------------|---------|-----------|--------------|----------|----------|----------|
+| basilisk-direct-summary | 8691.74 | 173849    | 100.00       | 2.66     | 2.31     | 5.45     |
+| haproxy-front-summary   | 4704.60 | 94106     | 100.00       | 4.92     | 3.99     | 11.16    |
+| nginx-front-summary     | 904.46  | 18119     | 100.00       | 27.41    | 7.61     | 131.35   |
 
-Baseline target: `basilisk-direct`
-- `haproxy-front` p95 delta vs. baseline: +2.23%
-- `nginx-front` p95 delta vs. baseline: +1240.40%
+Baseline target: `basilisk-direct-summary`
+- `haproxy-front-summary` p95 delta vs. baseline: +104.55%
+- `nginx-front-summary` p95 delta vs. baseline: +2307.99%
 
 **Round-trip (mixed GET ping / POST echo, 8 KB payload, 70 % POST)**
 
-| Traffic path            | Req/s    | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
-|-------------------------|----------|-----------|--------------|----------|----------|----------|
-| basilisk-direct-summary | 11999.26 | 240007    | 100.00       | 1.92     | 1.69     | 3.75     |
-| haproxy-front-summary   | 9738.09  | 194775    | 100.00       | 2.36     | 2.14     | 4.40     |
-| nginx-front-summary     | 1048.92  | 21005     | 100.00       | 23.72    | 4.26     | 67.51    |
+| Traffic path    | Req/s   | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
+|-----------------|---------|-----------|--------------|----------|----------|----------|
+| basilisk-direct | 6251.55 | 125045    | 100.00       | 3.60     | 2.98     | 8.05     |
+| haproxy-front   | 2752.04 | 55067     | 100.00       | 8.27     | 6.49     | 20.23    |
+| nginx-front     | 929.71  | 18622     | 100.00       | 26.51    | 9.99     | 83.97    |
 
-Baseline target: `basilisk-direct-summary`
-- `haproxy-front-summary` p95 delta vs. baseline: +17.59%
-- `nginx-front-summary` p95 delta vs. baseline: +1702.19%
+Baseline target: `basilisk-direct`
+- `haproxy-front` p95 delta vs. baseline: +151.29%
+- `nginx-front` p95 delta vs. baseline: +942.89%
 
 
 ## 12. Operational Notes
