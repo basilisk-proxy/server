@@ -267,6 +267,8 @@ print(response.payload_json)
 - `use({ruleFn1, ruleFn2, ...}, handlerFn)` - middleware mounted for multiple predicate rules
 - `use_after(ruleFn, handlerFn)` - post-request middleware that runs after proxy handling
 - `use_after({ruleFn1, ruleFn2, ...}, handlerFn)` - post-request middleware mounted for multiple rules
+- `forward(ruleFn, upstreams)` - static HTTP forwarding for matching requests
+- `forward({ruleFn1, ruleFn2, ...}, upstreams)` - static forwarding mounted for multiple rules
 
 `path_rules`
 
@@ -532,6 +534,27 @@ basilisk.proxy.use(function(req, res, next)
     return next()
 end)
 ```
+
+### 6.10 Static HTTP forwarding with `proxy.forward`
+
+`proxy.forward` routes matching requests directly to one or more static upstream endpoints.
+
+```lua
+basilisk.proxy.forward(path_rules.has_prefix("/external"), {
+  { scheme = "http", host = "10.0.0.10", port = 8080 },
+  { scheme = "http", host = "10.0.0.11", port = 8080 }
+})
+```
+
+Upstream entries can be declared as tables (`{ scheme, host, port }`) or as URI strings (`"https://api.example.com:443"`).
+
+Route health is evaluated from upstream TCP reachability:
+
+- `Up`: all configured upstreams are reachable
+- `Degraded`: at least one upstream is reachable, but not all
+- `Down`: no configured upstream is reachable
+
+When `port = 0`, Basilisk treats the upstream as host-only and uses the default port for reachability checks (`80` for HTTP, `443` for HTTPS).
 
 ## 7. HTTP Registry API
 
@@ -863,6 +886,7 @@ Baseline target: `basilisk-direct-summary`
 - Lua middleware runs in-process; panics or heavy logic can impact request latency.
 - `service_bus.max_message_chars` limits inbound line length per client message.
 - Runtime telemetry is available at `GET /registry/metrics/runtime`.
+- Runtime telemetry includes static forwarding route health under `static_forward_routes`.
 - Proxy latency is aggregated by phase (`proxy.middleware`, `proxy.resolve_service`, `proxy.pick_healthy_instance`,
   `proxy.send_upstream_request`, `proxy.wait_upstream_response_body`, `proxy.total`).
 - TLS config fields exist in runtime config; bind/termination behavior depends on the current HTTP serving setup.

@@ -1,3 +1,4 @@
+use crate::models::InstanceStatus;
 use crate::service_bus::contracts::ServiceBusEventEnvelope;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -8,6 +9,7 @@ use std::time::Duration;
 pub struct RuntimeTelemetry {
     proxy_latency: DashMap<String, LatencySummary>,
     service_distributions: DashMap<String, DistributionSummary>,
+    static_forward_routes: DashMap<String, StaticForwardSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +36,17 @@ pub struct DistributionSummary {
 pub struct RuntimeTelemetrySnapshot {
     pub proxy_latency: Vec<(String, LatencySummary)>,
     pub service_distributions: Vec<DistributionSummary>,
+    pub static_forward_routes: Vec<StaticForwardSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StaticForwardSummary {
+    pub route_id: String,
+    pub configured_upstreams: usize,
+    pub reachable_upstreams: usize,
+    pub status: InstanceStatus,
+    pub selected_target: Option<String>,
+    pub last_seen_utc: DateTime<Utc>,
 }
 
 impl Default for RuntimeTelemetry {
@@ -47,6 +60,7 @@ impl RuntimeTelemetry {
         Self {
             proxy_latency: DashMap::new(),
             service_distributions: DashMap::new(),
+            static_forward_routes: DashMap::new(),
         }
     }
 
@@ -108,6 +122,35 @@ impl RuntimeTelemetry {
         entry.last_seen_utc = Utc::now();
     }
 
+    /// Records the current health of a statically configured forwarding route.
+    pub fn record_static_forward_health(
+        &self,
+        route_id: &str,
+        configured_upstreams: usize,
+        reachable_upstreams: usize,
+        selected_target: Option<&str>,
+    ) {
+        let status = if reachable_upstreams == 0 {
+            InstanceStatus::Down
+        } else if reachable_upstreams < configured_upstreams {
+            InstanceStatus::Degraded
+        } else {
+            InstanceStatus::Up
+        };
+
+        self.static_forward_routes.insert(
+            route_id.to_string(),
+            StaticForwardSummary {
+                route_id: route_id.to_string(),
+                configured_upstreams,
+                reachable_upstreams,
+                status,
+                selected_target: selected_target.map(ToString::to_string),
+                last_seen_utc: Utc::now(),
+            },
+        );
+    }
+
     pub fn snapshot(&self) -> RuntimeTelemetrySnapshot {
         RuntimeTelemetrySnapshot {
             proxy_latency: self
@@ -117,6 +160,11 @@ impl RuntimeTelemetry {
                 .collect(),
             service_distributions: self
                 .service_distributions
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect(),
+            static_forward_routes: self
+                .static_forward_routes
                 .iter()
                 .map(|entry| entry.value().clone())
                 .collect(),
@@ -189,5 +237,24 @@ mod tests {
         assert_eq!(metric.min, 12.5);
         assert_eq!(metric.max, 12.5);
         assert_eq!(metric.last, 12.5);
+    }
+
+    #[test]
+    fn records_static_forward_health_summary() {
+        let telemetry = RuntimeTelemetry::new();
+
+        telemetry.record_static_forward_health("route-1", 2, 1, Some("http://upstream"));
+
+        let snapshot = telemetry.snapshot();
+        let route = snapshot
+            .static_forward_routes
+            .into_iter()
+            .find(|route| route.route_id == "route-1")
+            .expect("static forward summary should exist");
+
+        assert_eq!(route.configured_upstreams, 2);
+        assert_eq!(route.reachable_upstreams, 1);
+        assert_eq!(route.status, InstanceStatus::Degraded);
+        assert_eq!(route.selected_target.as_deref(), Some("http://upstream"));
     }
 }

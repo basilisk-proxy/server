@@ -40,7 +40,7 @@ impl ServiceInstance {
     }
 }
 
-fn format_uri_host(host: &str) -> String {
+pub(crate) fn format_uri_host(host: &str) -> String {
     if host.starts_with('[') || !host.contains(':') {
         host.to_string()
     } else {

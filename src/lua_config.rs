@@ -1,6 +1,7 @@
 use crate::cache::GatewayCache;
 use crate::config::GatewayConfig;
 use crate::helper::set_headers;
+use crate::models::InstanceStatus;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::ConnectionManager;
 use crate::service_bus::contracts::{
@@ -12,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use mlua::{Function, Lua, MultiValue, RegistryKey, Result as LuaResult, Table, Value};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -23,6 +24,7 @@ pub struct LuaRuntime {
     lua: Mutex<Lua>,
     before_middlewares: Mutex<Vec<MiddlewareMount>>,
     after_middlewares: Mutex<Vec<MiddlewareMount>>,
+    static_forward_mounts: Mutex<Vec<StaticForwardMount>>,
     registration_allowlist_rules: Mutex<Vec<RegistryKey>>,
     /// Registered service-bus event handlers: topic → handler key.
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
@@ -37,6 +39,28 @@ struct MiddlewareMount {
     handler_key: RegistryKey,
 }
 
+struct StaticForwardMount {
+    route_id: String,
+    matcher: MiddlewareMatcher,
+    upstreams: Vec<StaticForwardUpstream>,
+}
+
+#[derive(Clone)]
+struct StaticForwardUpstream {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticForwardResolution {
+    pub route_id: String,
+    pub status: InstanceStatus,
+    pub configured_upstreams: usize,
+    pub reachable_upstreams: usize,
+    pub reachable_targets: Vec<String>,
+}
+
 struct PrimitiveContext {
     config: Arc<Mutex<GatewayConfig>>,
     cache: Arc<GatewayCache>,
@@ -44,6 +68,7 @@ struct PrimitiveContext {
     connection_manager: Arc<ConnectionManager>,
     before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
     after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    static_forward_mounts: Arc<Mutex<Vec<StaticForwardMount>>>,
     registration_allowlist_rules: Arc<Mutex<Vec<RegistryKey>>>,
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
 }
@@ -147,6 +172,7 @@ pub fn load_config_and_runtime(
 
     let before_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
     let after_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
+    let static_forward_mounts = Arc::new(Mutex::new(Vec::<StaticForwardMount>::new()));
     let registration_allowlist_rules = Arc::new(Mutex::new(Vec::<RegistryKey>::new()));
     let config_state = Arc::new(Mutex::new(GatewayConfig::default()));
     let cache = Arc::new(GatewayCache::new("memory")?);
@@ -160,6 +186,7 @@ pub fn load_config_and_runtime(
         connection_manager: Arc::clone(&connection_manager),
         before_middleware_mounts: Arc::clone(&before_middleware_mounts),
         after_middleware_mounts: Arc::clone(&after_middleware_mounts),
+        static_forward_mounts: Arc::clone(&static_forward_mounts),
         registration_allowlist_rules: Arc::clone(&registration_allowlist_rules),
         event_handlers: Arc::clone(&event_handlers),
     };
@@ -211,6 +238,13 @@ pub fn load_config_and_runtime(
                 .drain(..)
                 .collect(),
         ),
+        static_forward_mounts: Mutex::new(
+            static_forward_mounts
+                .lock()
+                .map_err(|_| anyhow!("Lua static forward lock poisoned"))?
+                .drain(..)
+                .collect(),
+        ),
         registration_allowlist_rules: Mutex::new(
             registration_allowlist_rules
                 .lock()
@@ -258,6 +292,7 @@ impl LuaRuntime {
             lua: Mutex::new(Lua::new()),
             before_middlewares: Mutex::new(Vec::new()),
             after_middlewares: Mutex::new(Vec::new()),
+            static_forward_mounts: Mutex::new(Vec::new()),
             registration_allowlist_rules: Mutex::new(Vec::new()),
             event_handlers: Arc::new(Mutex::new(HashMap::new())),
             event_dispatch_tx,
@@ -465,6 +500,85 @@ impl LuaRuntime {
 
         Ok(current_response)
     }
+
+    /// Resolves a statically configured HTTP forwarding route if one matches.
+    pub fn resolve_static_forward(
+        &self,
+        path: &str,
+        method: &str,
+        headers: &HeaderMap,
+        connection_info: &RequestConnectionInfo,
+    ) -> anyhow::Result<Option<StaticForwardResolution>> {
+        let lua = self
+            .lua
+            .lock()
+            .map_err(|_| anyhow!("Lua runtime lock poisoned"))?;
+        let mounts = self
+            .static_forward_mounts
+            .lock()
+            .map_err(|_| anyhow!("Lua static forward lock poisoned"))?;
+        let host = extract_host(headers);
+
+        for mount in mounts.iter() {
+            if !matcher_applies(
+                &lua,
+                &mount.matcher,
+                path,
+                method,
+                headers,
+                &host,
+                connection_info,
+            )
+            .map_err(lua_to_anyhow)?
+            {
+                continue;
+            }
+
+            let reachable_targets: Vec<String> = mount
+                .upstreams
+                .iter()
+                .filter(|upstream| static_forward_upstream_reachable(upstream))
+                .map(StaticForwardUpstream::to_uri)
+                .collect();
+
+            let status = if reachable_targets.is_empty() {
+                InstanceStatus::Down
+            } else if reachable_targets.len() < mount.upstreams.len() {
+                InstanceStatus::Degraded
+            } else {
+                InstanceStatus::Up
+            };
+
+            return Ok(Some(StaticForwardResolution {
+                route_id: mount.route_id.clone(),
+                status,
+                configured_upstreams: mount.upstreams.len(),
+                reachable_upstreams: reachable_targets.len(),
+                reachable_targets,
+            }));
+        }
+
+        Ok(None)
+    }
+}
+
+fn matcher_applies(
+    lua: &Lua,
+    matcher: &MiddlewareMatcher,
+    path: &str,
+    method: &str,
+    headers: &HeaderMap,
+    host: &str,
+    connection_info: &RequestConnectionInfo,
+) -> LuaResult<bool> {
+    match matcher {
+        MiddlewareMatcher::Any => Ok(true),
+        MiddlewareMatcher::Predicate(rule_key) => {
+            let rule: Function = lua.registry_value(rule_key)?;
+            let req = build_matcher_req_table(lua, path, method, headers, host, connection_info)?;
+            rule.call::<bool>(req)
+        }
+    }
 }
 
 fn middleware_applies(
@@ -476,14 +590,15 @@ fn middleware_applies(
     host: &str,
     connection_info: &RequestConnectionInfo,
 ) -> LuaResult<bool> {
-    match &mount.matcher {
-        MiddlewareMatcher::Any => Ok(true),
-        MiddlewareMatcher::Predicate(rule_key) => {
-            let rule: Function = lua.registry_value(rule_key)?;
-            let req = build_matcher_req_table(lua, path, method, headers, host, connection_info)?;
-            rule.call::<bool>(req)
-        }
-    }
+    matcher_applies(
+        lua,
+        &mount.matcher,
+        path,
+        method,
+        headers,
+        host,
+        connection_info,
+    )
 }
 
 fn execute_middleware(
@@ -798,6 +913,7 @@ fn register_primitives(lua: &Lua, context: &PrimitiveContext) -> LuaResult<()> {
             lua,
             Arc::clone(&context.before_middleware_mounts),
             Arc::clone(&context.after_middleware_mounts),
+            Arc::clone(&context.static_forward_mounts),
         )?,
     )?;
 
@@ -1632,6 +1748,7 @@ fn make_proxy_api(
     lua: &Lua,
     before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
     after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
+    static_forward_mounts: Arc<Mutex<Vec<StaticForwardMount>>>,
 ) -> LuaResult<Table> {
     let table = lua.create_table()?;
 
@@ -1679,6 +1796,27 @@ fn make_proxy_api(
         })?,
     )?;
 
+    let mounts = Arc::clone(&static_forward_mounts);
+    table.set(
+        "forward",
+        lua.create_function(move |lua, args: MultiValue| {
+            let (matchers, upstreams) = parse_proxy_forward_args(lua, args)?;
+            let mut guard = mounts
+                .lock()
+                .map_err(|_| mlua::Error::external("Lua static forward lock poisoned"))?;
+            let route_id = format!("static-forward-{}", Uuid::now_v7());
+
+            for matcher in matchers {
+                guard.push(StaticForwardMount {
+                    route_id: route_id.clone(),
+                    matcher,
+                    upstreams: upstreams.clone(),
+                });
+            }
+            Ok(())
+        })?,
+    )?;
+
     Ok(table)
 }
 
@@ -1708,6 +1846,168 @@ fn parse_middleware_use_args(
         _ => Err(mlua::Error::external(
             "proxy.use expects use(handler), use(ruleFn, handler), or use({ruleFn, ...}, handler)",
         )),
+    }
+}
+
+fn parse_proxy_forward_args(
+    lua: &Lua,
+    args: MultiValue,
+) -> LuaResult<(Vec<MiddlewareMatcher>, Vec<StaticForwardUpstream>)> {
+    let values: Vec<Value> = args.into_vec();
+    match values.as_slice() {
+        [Value::Function(rule), Value::Table(upstreams)] => {
+            let rule_key = lua.create_registry_value(rule.clone())?;
+            Ok((
+                vec![MiddlewareMatcher::Predicate(rule_key)],
+                parse_static_forward_upstreams(upstreams)?,
+            ))
+        }
+        [Value::Table(rules), Value::Table(upstreams)] => Ok((
+            parse_matcher_array(lua, rules)?,
+            parse_static_forward_upstreams(upstreams)?,
+        )),
+        _ => Err(mlua::Error::external(
+            "proxy.forward expects forward(ruleFn, upstreams) or forward({ruleFn, ...}, upstreams)",
+        )),
+    }
+}
+
+fn parse_static_forward_upstreams(table: &Table) -> LuaResult<Vec<StaticForwardUpstream>> {
+    let mut upstreams = Vec::new();
+    let mut index = 1;
+
+    loop {
+        let value: Value = table.raw_get(index)?;
+        match value {
+            Value::Nil => break,
+            Value::String(uri) => {
+                upstreams.push(parse_static_forward_upstream_uri(uri.to_str()?.as_ref())?)
+            }
+            Value::Table(endpoint) => {
+                upstreams.push(parse_static_forward_upstream_table(&endpoint)?)
+            }
+            _ => {
+                return Err(mlua::Error::external(
+                    "proxy.forward upstreams must be strings or tables",
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    if upstreams.is_empty() {
+        return Err(mlua::Error::external(
+            "proxy.forward requires at least one upstream",
+        ));
+    }
+
+    Ok(upstreams)
+}
+
+fn parse_static_forward_upstream_table(table: &Table) -> LuaResult<StaticForwardUpstream> {
+    let scheme = table
+        .get::<Option<String>>("scheme")?
+        .unwrap_or_else(|| "http".to_string());
+    let host: String = table.get("host")?;
+    let port = table.get::<Option<u16>>("port")?.unwrap_or(0);
+
+    if host.trim().is_empty() {
+        return Err(mlua::Error::external(
+            "proxy.forward upstream host is required",
+        ));
+    }
+
+    Ok(StaticForwardUpstream { scheme, host, port })
+}
+
+fn parse_static_forward_upstream_uri(uri: &str) -> LuaResult<StaticForwardUpstream> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return Err(mlua::Error::external(
+            "proxy.forward upstream URI cannot be empty",
+        ));
+    }
+
+    let (scheme, rest) = if let Some(rest) = uri.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = uri.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        ("http", uri)
+    };
+
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) =
+        parse_upstream_authority(authority, if scheme == "https" { 443 } else { 80 })?;
+
+    Ok(StaticForwardUpstream {
+        scheme: scheme.to_string(),
+        host,
+        port,
+    })
+}
+
+fn parse_upstream_authority(authority: &str, default_port: u16) -> LuaResult<(String, u16)> {
+    if let Some(stripped) = authority.strip_prefix('[')
+        && let Some(end_bracket) = stripped.find(']')
+    {
+        let host = stripped[..end_bracket].to_string();
+        let port = stripped[end_bracket + 1..]
+            .strip_prefix(':')
+            .and_then(|raw| raw.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok((host, port));
+    }
+
+    if let Some(colon) = authority.rfind(':') {
+        let host = authority[..colon].to_string();
+        let port = authority[colon + 1..]
+            .parse::<u16>()
+            .unwrap_or(default_port);
+        return Ok((host, port));
+    }
+
+    Ok((authority.to_string(), default_port))
+}
+
+impl StaticForwardUpstream {
+    fn to_uri(&self) -> String {
+        let host = crate::models::format_uri_host(&self.host);
+        if self.port == 0 {
+            format!("{}://{}", self.scheme, host)
+        } else {
+            format!("{}://{}:{}", self.scheme, host, self.port)
+        }
+    }
+}
+
+fn static_forward_upstream_reachable(upstream: &StaticForwardUpstream) -> bool {
+    let port = if upstream.port == 0 {
+        default_port_for_scheme(&upstream.scheme)
+    } else {
+        upstream.port
+    };
+
+    let authority = if upstream.host.starts_with('[') || !upstream.host.contains(':') {
+        format!("{}:{}", upstream.host, port)
+    } else {
+        format!("[{}]:{}", upstream.host, port)
+    };
+
+    let Some(socket_addr) = authority.to_socket_addrs().ok().and_then(|mut addrs| {
+        addrs.find(|addr| matches!(addr, SocketAddr::V4(_) | SocketAddr::V6(_)))
+    }) else {
+        return false;
+    };
+
+    TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(200)).is_ok()
+}
+
+fn default_port_for_scheme(scheme: &str) -> u16 {
+    if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
     }
 }
 

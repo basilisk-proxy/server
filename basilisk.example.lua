@@ -38,6 +38,15 @@ basilisk.service_bus.monitoring_enabled(true)
 -- Example: bind static route ownership in the registry
 basilisk.registry.bind_path("/api/orders", "orders-service")
 
+
+-- Example: static HTTP forwarding for a matching rule function.
+-- Route health is computed from upstream reachability:
+-- Up (all reachable), Degraded (partial), Down (none reachable).
+basilisk.proxy.forward(path_rules.has_prefix("/external"), {
+   { scheme = "http", host = "10.0.0.10", port = 8080 },
+   { scheme = "http", host = "10.0.0.11", port = 8080 },
+})
+
 -- Example: middleware storing context and forwarding auth headers
 basilisk.proxy.use(function(req, _, next)
   -- Perform authentication and store in context

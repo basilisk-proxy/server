@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
+use axum::{Router, routing::get};
 use basilisk::config::GatewayConfig;
 use basilisk::gateway::{
     AppState,
@@ -21,6 +22,16 @@ fn test_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("basilisk-public-proxy-{}-{}", name, Uuid::new_v4()));
     fs::create_dir_all(&path).expect("failed to create temp test dir");
     path
+}
+
+fn find_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to reserve port");
+    let port = listener
+        .local_addr()
+        .expect("failed to read local addr")
+        .port();
+    drop(listener);
+    port
 }
 
 #[tokio::test]
@@ -159,5 +170,89 @@ async fn proxy_internal_cache_keys_are_prefixed_and_do_not_collide_with_user_key
         Some("user-owned")
     );
 
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn proxy_handler_routes_static_forward_and_reports_degraded_health() {
+    let upstream = Router::new().route("/static/hello", get(|| async { "forwarded" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind upstream listener");
+    let good_port = listener
+        .local_addr()
+        .expect("failed to read upstream local addr")
+        .port();
+    let bad_port = find_free_port();
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(listener, upstream)
+            .await
+            .expect("static upstream server failed")
+    });
+
+    let dir = test_dir("static_forward");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        format!(
+            "basilisk.proxy.forward(path_rules.has_prefix('/static'), {{\n  {{ scheme = 'http', host = '127.0.0.1', port = {good_port} }},\n  {{ scheme = 'http', host = '127.0.0.1', port = {bad_port} }},\n}})\n"
+        ),
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+    let (_cfg, lua_runtime, cache) = load_config_and_runtime(
+        &script.to_string_lossy(),
+        Arc::clone(&registry),
+        Arc::clone(&connection_manager),
+    )
+    .expect("failed to load lua runtime");
+
+    let state = Arc::new(AppState {
+        config: GatewayConfig::default(),
+        gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+        registry,
+        connection_manager,
+        proxy_handler: ProxyHandler::new(),
+        lua_runtime,
+        cache,
+        upstream_client: new_upstream_http_client(),
+        telemetry: Arc::new(RuntimeTelemetry::new()),
+    });
+
+    let socket_addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let req = Request::builder()
+        .uri("/static/hello")
+        .body(Body::empty())
+        .expect("failed to build request");
+
+    let resp = ProxyHandler::handle_proxy(State(state.clone()), ConnectInfo(socket_addr), req)
+        .await
+        .into_response();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024)
+        .await
+        .expect("failed to read response body");
+    assert_eq!(body, "forwarded");
+
+    let snapshot = state.telemetry.snapshot();
+    let summary = snapshot
+        .static_forward_routes
+        .into_iter()
+        .next()
+        .expect("static forward summary should exist");
+
+    assert_eq!(summary.status, basilisk::models::InstanceStatus::Degraded);
+    assert_eq!(summary.configured_upstreams, 2);
+    assert_eq!(summary.reachable_upstreams, 1);
+    let expected_target = format!("http://127.0.0.1:{good_port}");
+    assert_eq!(
+        summary.selected_target.as_deref(),
+        Some(expected_target.as_str())
+    );
+
+    upstream_handle.abort();
     let _ = fs::remove_dir_all(dir);
 }

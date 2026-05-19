@@ -133,6 +133,7 @@ impl ProxyHandler {
                     &path,
                     &remote_ip,
                     remote_port,
+                    connection_info.clone(),
                     middleware_result.forward_headers,
                     req,
                 )
@@ -206,10 +207,99 @@ impl ProxyHandler {
         path: &str,
         remote_ip: &str,
         remote_port: u16,
+        connection_info: RequestConnectionInfo,
         forward_headers: HashMap<String, String>,
         req: Request,
     ) -> (Response<Body>, Option<String>, HashMap<String, f64>) {
         let mut metrics = HashMap::new();
+
+        let static_forward_started = Instant::now();
+        match state.lua_runtime.resolve_static_forward(
+            path,
+            req.method().as_str(),
+            req.headers(),
+            &connection_info,
+        ) {
+            Ok(Some(resolution)) => {
+                let static_forward_elapsed = static_forward_started.elapsed();
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.resolve_static_forward", static_forward_elapsed);
+                metrics.insert(
+                    "proxy.resolve_static_forward_ms".to_string(),
+                    duration_to_ms(static_forward_elapsed),
+                );
+
+                if resolution.reachable_targets.is_empty() {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        Some("No reachable static upstreams available".to_string()),
+                        metrics,
+                    );
+                }
+
+                let target_index = state.proxy_handler.pick_round_robin_index(
+                    &state,
+                    &resolution.route_id,
+                    resolution.reachable_targets.len(),
+                );
+                let selected_upstream = &resolution.reachable_targets[target_index];
+                let target_uri = compose_static_target_uri(
+                    selected_upstream,
+                    req.uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or(path),
+                );
+                state.telemetry.record_static_forward_health(
+                    &resolution.route_id,
+                    resolution.configured_upstreams,
+                    resolution.reachable_upstreams,
+                    Some(selected_upstream),
+                );
+
+                let (response, error_message, send_ms, body_ms) = Self::forward_request(
+                    &state.upstream_client,
+                    target_uri,
+                    req,
+                    remote_ip,
+                    remote_port,
+                    forward_headers,
+                    Arc::clone(&state.telemetry),
+                )
+                .await;
+                metrics.insert("proxy.send_upstream_request_ms".to_string(), send_ms);
+                metrics.insert("proxy.wait_upstream_response_body_ms".to_string(), body_ms);
+
+                return (response, error_message, metrics);
+            }
+            Ok(None) => {
+                let static_forward_elapsed = static_forward_started.elapsed();
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.resolve_static_forward", static_forward_elapsed);
+                metrics.insert(
+                    "proxy.resolve_static_forward_ms".to_string(),
+                    duration_to_ms(static_forward_elapsed),
+                );
+            }
+            Err(err) => {
+                let static_forward_elapsed = static_forward_started.elapsed();
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.resolve_static_forward", static_forward_elapsed);
+                metrics.insert(
+                    "proxy.resolve_static_forward_ms".to_string(),
+                    duration_to_ms(static_forward_elapsed),
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    Some(err.to_string()),
+                    metrics,
+                );
+            }
+        }
+
         let resolve_started = Instant::now();
         let (service_id, service) = match Self::resolve_service(&state, path) {
             Ok(res) => res,
@@ -650,21 +740,26 @@ impl ProxyHandler {
         service_id: &str,
         instances: &[&'a ServiceInstance],
     ) -> &'a ServiceInstance {
-        if let Ok(counter) = state
-            .cache
-            .internal_incr(&format!("balancer:rr:{service_id}"), 1)
+        let index = self.pick_round_robin_index(state, service_id, instances.len());
+        instances[index]
+    }
+
+    fn pick_round_robin_index(&self, state: &AppState, key: &str, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+
+        if let Ok(counter) = state.cache.internal_incr(&format!("balancer:rr:{key}"), 1)
             && counter > 0
         {
-            let index = (counter.saturating_sub(1) as usize) % instances.len();
-            return instances[index];
+            return (counter.saturating_sub(1) as usize) % len;
         }
 
         let counter = self
             .counters
-            .entry(service_id.to_string())
+            .entry(key.to_string())
             .or_insert_with(|| AtomicUsize::new(0));
-        let index = counter.fetch_add(1, Ordering::SeqCst) % instances.len();
-        instances[index]
+        counter.fetch_add(1, Ordering::SeqCst) % len
     }
 
     fn pick_weighted_round_robin<'a>(
@@ -729,6 +824,16 @@ impl ProxyHandler {
 
 fn duration_to_ms(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn compose_static_target_uri(base_uri: &str, path_and_query: &str) -> String {
+    let mut target = String::with_capacity(base_uri.len() + path_and_query.len() + 1);
+    target.push_str(base_uri.trim_end_matches('/'));
+    if !path_and_query.starts_with('/') {
+        target.push('/');
+    }
+    target.push_str(path_and_query);
+    target
 }
 
 /// Returns `true` if the resolved upstream `target_uri` points back at the gateway's
@@ -1017,7 +1122,7 @@ mod tests {
         let target = ProxyHandler::prepare_target_uri(&state, &service, "/api/ping", &instance);
 
         assert_eq!(target, "http://orders-svc/ping");
-    }w
+    }
 
     #[tokio::test]
     async fn proxy_handler_returns_loop_detected_when_upstream_is_self() {
