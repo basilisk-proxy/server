@@ -26,9 +26,25 @@ pub struct ServiceInstance {
 }
 
 impl ServiceInstance {
-    /// Returns the base URI (scheme + host + port) for this instance.
+    /// Returns the base URI for this instance.
+    ///
+    /// When `port == 0`, the URI is emitted without an explicit port, so the
+    /// upstream can rely on its default port for the scheme.
     pub fn to_uri(&self) -> String {
-        format!("{}://{}:{}", self.scheme, self.host, self.port)
+        let host = format_uri_host(&self.host);
+        if self.port == 0 {
+            format!("{}://{}", self.scheme, host)
+        } else {
+            format!("{}://{}:{}", self.scheme, host, self.port)
+        }
+    }
+}
+
+fn format_uri_host(host: &str) -> String {
+    if host.starts_with('[') || !host.contains(':') {
+        host.to_string()
+    } else {
+        format!("[{host}]")
     }
 }
 

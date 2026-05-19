@@ -992,6 +992,33 @@ mod tests {
         assert!(!is_self_routing("http://orders-svc:8084/foo", gateway_addr));
     }
 
+    #[test]
+    fn prepare_target_uri_omits_port_when_instance_uses_default_port() {
+        let state = test_state();
+        let service = ServiceDefinition {
+            service_id: "orders".to_string(),
+            fingerprint: "fp".to_string(),
+            path_prefixes: vec!["/api".to_string()],
+            instances: HashMap::new(),
+        };
+        let instance = ServiceInstance {
+            instance_id: "orders-1".to_string(),
+            service_id: "orders".to_string(),
+            token: "token".to_string(),
+            scheme: "http".to_string(),
+            host: "orders-svc".to_string(),
+            port: 0,
+            weight: 1,
+            status: InstanceStatus::Up,
+            active_connections: 0,
+            last_heartbeat_utc: chrono::Utc::now(),
+        };
+
+        let target = ProxyHandler::prepare_target_uri(&state, &service, "/api/ping", &instance);
+
+        assert_eq!(target, "http://orders-svc/ping");
+    }w
+
     #[tokio::test]
     async fn proxy_handler_returns_loop_detected_when_upstream_is_self() {
         // Register a service whose instance address points back at the gateway port.

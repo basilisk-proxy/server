@@ -73,8 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     if config.service_bus.monitoring_enabled {
         let (metrics_tx, mut metrics_rx) = mpsc::unbounded_channel();
-        connection_manager
-            .subscribe_internal(BASILISK_METRICS_DISTRIBUTION_TOPIC.to_string(), metrics_tx);
+        connection_manager.subscribe_internal(BASILISK_METRICS_DISTRIBUTION_TOPIC.to_string(), metrics_tx);
         let telemetry_for_metrics = Arc::clone(&telemetry);
         let registry_for_metrics = Arc::clone(&registry);
 

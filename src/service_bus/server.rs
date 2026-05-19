@@ -3,9 +3,8 @@ use crate::models::InstanceStatus;
 use crate::registry::ServiceRegistry;
 use crate::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use crate::service_bus::contracts::{
-    BASILISK_INSTANCE_ID, BASILISK_METRICS_DISTRIBUTION_TOPIC, BASILISK_SERVICE_ID,
-    ServiceBusEventEnvelope, ServiceBusForwardRequest, ServiceBusForwardResponse,
-    ServiceBusProtocolMessage, protocol_types,
+    BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID, ServiceBusEventEnvelope, ServiceBusForwardRequest,
+    ServiceBusForwardResponse, ServiceBusProtocolMessage, protocol_types,
 };
 use chrono::Utc;
 use std::collections::HashMap;
@@ -197,11 +196,6 @@ async fn handle_client(
                                     ..Default::default()
                                 });
 
-                                if monitoring_enabled {
-                                    connection_manager.subscribe_basilisk(vec![
-                                        BASILISK_METRICS_DISTRIBUTION_TOPIC.to_string(),
-                                    ]);
-                                }
                             }
                         } else {
                             let _ = tx.send(ServiceBusProtocolMessage {

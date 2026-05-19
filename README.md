@@ -570,6 +570,8 @@ Notes:
 - Path prefix ownership is exclusive across services.
 - If `instance.instanceId` is empty, Basilisk generates a cryptographically secure instance ID and returns it in the
   registration response.
+- Set `instance.port` to `0` to advertise a host-only upstream; Basilisk omits `:port` when building the proxy target
+  URI and lets the upstream rely on its scheme default port.
 
 ### 7.2 Deregister
 
