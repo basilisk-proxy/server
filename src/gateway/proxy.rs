@@ -360,7 +360,17 @@ impl ProxyHandler {
             duration_to_ms(pick_elapsed),
         );
 
-        let target_uri = Self::prepare_target_uri(&state, &service, path, target_instance);
+        let request_path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(path);
+        let target_uri = Self::prepare_target_uri(
+            &state,
+            &service,
+            request_path_and_query,
+            target_instance,
+        );
 
         // Self-routing guard: reject immediately if the resolved target points back at
         // this gateway instance. This prevents tight routing loops without burning hop
@@ -496,9 +506,13 @@ impl ProxyHandler {
     fn prepare_target_uri(
         state: &AppState,
         service: &ServiceDefinition,
-        path: &str,
+        path_and_query: &str,
         instance: &ServiceInstance,
     ) -> String {
+        let (path, query) = path_and_query
+            .split_once('?')
+            .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
+
         let mut final_path = path;
         if state.config.routing.strip_prefix
             && let Some(prefix) = service.path_prefixes.iter().find(|p| path.starts_with(*p))
@@ -507,10 +521,18 @@ impl ProxyHandler {
         }
         let stripped = final_path.strip_prefix('/').unwrap_or(final_path);
         let base_uri = instance.to_uri();
-        let mut target = String::with_capacity(base_uri.len() + 1 + stripped.len());
+        let mut target = String::with_capacity(base_uri.len() + 1 + stripped.len() + 32);
         target.push_str(&base_uri);
         target.push('/');
         target.push_str(stripped);
+
+        if let Some(query) = query
+            && !query.is_empty()
+        {
+            target.push('?');
+            target.push_str(query);
+        }
+
         target
     }
 
@@ -1122,6 +1144,34 @@ mod tests {
         let target = ProxyHandler::prepare_target_uri(&state, &service, "/api/ping", &instance);
 
         assert_eq!(target, "http://orders-svc/ping");
+    }
+
+    #[test]
+    fn prepare_target_uri_preserves_query_parameters() {
+        let state = test_state();
+        let service = ServiceDefinition {
+            service_id: "orders".to_string(),
+            fingerprint: "fp".to_string(),
+            path_prefixes: vec!["/api".to_string()],
+            instances: HashMap::new(),
+        };
+        let instance = ServiceInstance {
+            instance_id: "orders-1".to_string(),
+            service_id: "orders".to_string(),
+            token: "token".to_string(),
+            scheme: "http".to_string(),
+            host: "orders-svc".to_string(),
+            port: 0,
+            weight: 1,
+            status: InstanceStatus::Up,
+            active_connections: 0,
+            last_heartbeat_utc: chrono::Utc::now(),
+        };
+
+        let target =
+            ProxyHandler::prepare_target_uri(&state, &service, "/api/ping?foo=bar&baz=1", &instance);
+
+        assert_eq!(target, "http://orders-svc/ping?foo=bar&baz=1");
     }
 
     #[tokio::test]
