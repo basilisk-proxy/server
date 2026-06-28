@@ -8,3 +8,4 @@ pub mod models;
 pub mod observability;
 pub mod registry;
 pub mod service_bus;
+pub mod dto;

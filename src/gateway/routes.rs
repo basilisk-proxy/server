@@ -11,6 +11,7 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use crate::dto::ServiceData;
 
 const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
 
@@ -158,7 +159,9 @@ pub async fn deregister(
 
 /// Returns all currently registered services.
 pub async fn get_all_services(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let services = state.registry.get_all_services();
+    let services: Vec<ServiceData> = state.registry.get_all_services().iter()
+        .map(|s| ServiceData::from(s))
+        .collect();
     debug!(
         services_count = services.len(),
         "registry services snapshot requested"
@@ -173,7 +176,7 @@ pub async fn get_service(
 ) -> impl IntoResponse {
     if let Some(service) = state.registry.get_service(&service_id) {
         debug!(service_id = %service_id, instances_count = service.instances.len(), "registry service details requested");
-        Json(service).into_response()
+        Json(ServiceData::from(&service)).into_response()
     } else {
         warn!(service_id = %service_id, "registry service details requested for unknown service");
         StatusCode::NOT_FOUND.into_response()

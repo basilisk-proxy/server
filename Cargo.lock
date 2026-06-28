@@ -133,7 +133,6 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
- "hyper",
  "hyper-rustls",
  "hyper-util",
  "memcache",
