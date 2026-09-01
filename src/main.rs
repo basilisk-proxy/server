@@ -9,7 +9,8 @@ use basilisk::gateway::{
 };
 use basilisk::lua_config::load_config_and_runtime;
 use basilisk::observability::RuntimeTelemetry;
-use basilisk::registry::{ServiceRegistry, run_maintenance};
+use basilisk::registry::health::HealthMonitor;
+use basilisk::registry::{ServiceBusHealthMonitor, ServiceRegistry, run_maintenance};
 use basilisk::service_bus::connection_manager::ConnectionManager;
 use basilisk::service_bus::contracts::BASILISK_METRICS_DISTRIBUTION_TOPIC;
 use basilisk::service_bus::server::run_server;
@@ -77,11 +78,21 @@ async fn main() -> anyhow::Result<()> {
             .subscribe_internal(BASILISK_METRICS_DISTRIBUTION_TOPIC.to_string(), metrics_tx);
         let telemetry_for_metrics = Arc::clone(&telemetry);
         let registry_for_metrics = Arc::clone(&registry);
+        let monitor_config = config.clone();
+        // Health heartbeat is cleanly separated: only the bus monitor records it
+        // when enabled, so proxy recoveries are not overwritten when
+        // connection_health_enabled == false.
+        let bus_monitor = ServiceBusHealthMonitor;
 
         tokio::spawn(async move {
             while let Some(event) = metrics_rx.recv().await {
-                registry_for_metrics
-                    .record_metrics_heartbeat(&event.service_id, &event.instance_id);
+                if bus_monitor.is_enabled(&monitor_config) {
+                    bus_monitor.on_heartbeat(
+                        &registry_for_metrics,
+                        &event.service_id,
+                        &event.instance_id,
+                    );
+                }
                 telemetry_for_metrics.ingest_distribution_event(&event);
             }
         });

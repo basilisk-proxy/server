@@ -3,6 +3,8 @@ use crate::lua_config::AfterMiddlewareContext;
 use crate::lua_config::MiddlewareResponse;
 use crate::lua_config::RequestConnectionInfo;
 use crate::models::{InstanceStatus, ServiceDefinition, ServiceInstance};
+use crate::registry::ProxyHealthMonitor;
+use crate::registry::health::HealthMonitor;
 use axum::extract::ConnectInfo;
 use axum::{
     body::Body,
@@ -401,19 +403,23 @@ impl ProxyHandler {
         metrics.insert("proxy.send_upstream_request_ms".to_string(), send_ms);
         metrics.insert("proxy.wait_upstream_response_body_ms".to_string(), body_ms);
 
-        // When connection health is disabled (default), drive instance health from
-        // proxy reachability: N consecutive unreachable attempts → Down.
-        if !state.config.service_bus.connection_health_enabled {
+        // Proxy health is cleanly separated via HealthMonitor trait.
+        // When enabled (connection_health_enabled == false), N consecutive
+        // unreachable attempts → Down; a successful proxy → Up and clears
+        // the counter so bus state does not overwrite recoveries.
+        let proxy_monitor = ProxyHealthMonitor;
+        if proxy_monitor.is_enabled(&state.config) {
             let threshold = state.config.service_bus.proxy_failure_threshold;
             let instance_id = target_instance.instance_id.clone();
             if is_proxy_unreachable(&response, error_message.as_deref()) {
-                state
-                    .registry
-                    .record_proxy_failure(&service_id, &instance_id, threshold);
+                proxy_monitor.on_proxy_failure(
+                    &state.registry,
+                    &service_id,
+                    &instance_id,
+                    threshold,
+                );
             } else {
-                state
-                    .registry
-                    .record_proxy_success(&service_id, &instance_id);
+                proxy_monitor.on_proxy_success(&state.registry, &service_id, &instance_id);
             }
         }
 
@@ -493,13 +499,11 @@ impl ProxyHandler {
             .collect();
 
         if healthy_instances.is_empty() {
-            // When proxy-based health is active (connection_health_enabled == false),
-            // instances start Up and are only marked Down after consecutive proxy
-            // failures. To allow recovery, if no Up is available, fallback to any
-            // instance (including Down) so a successful downstream can mark it Up
-            // again via record_proxy_success.
-            if !state.config.service_bus.connection_health_enabled && !service.instances.is_empty()
-            {
+            // Proxy health is separated via HealthMonitor trait. When enabled,
+            // fallback to any instance (including Down) so a successful proxy
+            // can recover via on_proxy_success and not be blocked forever.
+            let proxy_monitor = ProxyHealthMonitor;
+            if proxy_monitor.is_enabled(&state.config) && !service.instances.is_empty() {
                 let fallback: SmallVec<[&ServiceInstance; 8]> =
                     service.instances.values().collect();
                 let strategy = state

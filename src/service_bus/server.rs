@@ -1,6 +1,6 @@
 use crate::config::GatewayConfig;
-use crate::models::InstanceStatus;
-use crate::registry::ServiceRegistry;
+use crate::registry::health::HealthMonitor;
+use crate::registry::{ProxyHealthMonitor, ServiceBusHealthMonitor, ServiceRegistry};
 use crate::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
 use crate::service_bus::contracts::{
     BASILISK_INSTANCE_ID, BASILISK_SERVICE_ID, ServiceBusEventEnvelope, ServiceBusForwardRequest,
@@ -32,8 +32,7 @@ pub async fn run_server(
         let connection_manager = Arc::clone(&connection_manager);
         let registry = Arc::clone(&registry);
         let max_message_chars = config.service_bus.max_message_chars;
-        let connection_health_enabled = config.service_bus.connection_health_enabled;
-        let monitoring_enabled = config.service_bus.monitoring_enabled;
+        let bus_config = config.clone();
 
         // Run this separately.
         tokio::spawn(async move {
@@ -42,8 +41,7 @@ pub async fn run_server(
                 connection_manager,
                 registry,
                 max_message_chars,
-                connection_health_enabled,
-                monitoring_enabled,
+                bus_config,
             )
             .await
             {
@@ -58,9 +56,13 @@ async fn handle_client(
     connection_manager: Arc<ConnectionManager>,
     registry: Arc<ServiceRegistry>,
     max_message_chars: usize,
-    connection_health_enabled: bool,
-    monitoring_enabled: bool,
+    bus_config: GatewayConfig,
 ) -> anyhow::Result<()> {
+    // Generic health monitors – clean separation.
+    let bus_monitor = ServiceBusHealthMonitor;
+    let _proxy_monitor = ProxyHealthMonitor;
+    let connection_health_enabled = bus_monitor.is_enabled(&bus_config);
+    let monitoring_enabled = bus_config.service_bus.monitoring_enabled;
     let peer = socket.peer_addr().ok();
     debug!(peer = ?peer, "service bus client session started");
     let (reader, mut writer) = socket.into_split();
@@ -175,12 +177,11 @@ async fn handle_client(
                                     },
                                 );
 
-                                if connection_health_enabled {
-                                    registry
-                                        .update_instance_status(&sid, &iid, InstanceStatus::Up)
-                                        .await;
-
-                                    if monitoring_enabled {
+                                if bus_monitor.is_enabled(&bus_config) {
+                                    bus_monitor.on_bus_connect(
+                                        &registry, &sid, &iid, &bus_config,
+                                    );
+                                    if bus_config.service_bus.monitoring_enabled {
                                         debug!(
                                             peer = ?peer,
                                             service_id = %sid,
@@ -336,25 +337,12 @@ async fn handle_client(
     }
 
     if let Some(key) = connection_key {
-        if connection_health_enabled {
+        if bus_monitor.is_enabled(&bus_config) {
             let identity = connected_identity
                 .clone()
                 .or_else(|| connection_manager.get_connection_info(&key));
             if let Some((sid, iid)) = identity {
-                if monitoring_enabled {
-                    warn!(
-                        peer = ?peer,
-                        connection_key = %key,
-                        service_id = %sid,
-                        instance_id = %iid,
-                        "service bus client disconnected; monitoring is authoritative so instance will transition down only after heartbeat timeout without metrics"
-                    );
-                } else {
-                    info!(peer = ?peer, connection_key = %key, service_id = %sid, instance_id = %iid, "service bus client disconnected; marking instance down");
-                    registry
-                        .update_instance_status(&sid, &iid, InstanceStatus::Down)
-                        .await;
-                }
+                bus_monitor.on_bus_disconnect(&registry, &sid, &iid, &bus_config);
             }
         }
         connection_manager.remove_connection(&key);

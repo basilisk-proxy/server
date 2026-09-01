@@ -1,4 +1,8 @@
+pub mod health;
 pub mod maintenance;
+pub use health::{
+    HealthMonitor, HealthMonitorRegistry, ProxyHealthMonitor, ServiceBusHealthMonitor,
+};
 pub use maintenance::run_maintenance;
 
 use crate::models::{InstanceStatus, RegistrationRequest, ServiceDefinition, ServiceInstance};
@@ -401,7 +405,7 @@ impl ServiceRegistry {
     ///
     /// Increments the consecutive failure counter and marks the instance `Down`
     /// once `threshold` consecutive unreachable attempts are observed.
-    /// Returns `true` if the instance was transitioned to `Down` by this call.
+    /// Returns `true` if this call transitioned the instance to `Down`.
     pub fn record_proxy_failure(
         &self,
         service_id: &str,
@@ -468,6 +472,57 @@ impl ServiceRegistry {
             .get(&metrics_key(service_id, instance_id))
             .map(|v| *v.value())
             .unwrap_or(0)
+    }
+
+    /// Synchronous status setter used by `HealthMonitor` implementations.
+    ///
+    /// Mirrors `update_instance_status` but is `sync` so trait objects can call
+    /// it without async.
+    pub(crate) fn set_instance_status_sync(
+        &self,
+        service_id: &str,
+        instance_id: &str,
+        status: InstanceStatus,
+    ) {
+        if let Some(mut service) = self.services.get_mut(service_id)
+            && let Some(instance) = service.instances.get_mut(instance_id)
+        {
+            instance.status = status;
+            info!(
+                service_id = %service_id,
+                instance_id = %instance_id,
+                status = ?status,
+                "registry instance status updated (sync)"
+            );
+            if status == InstanceStatus::Up {
+                instance.last_heartbeat_utc = Utc::now();
+            }
+            if status == InstanceStatus::Up || status == InstanceStatus::Down {
+                self.proxy_failure_counts
+                    .remove(&metrics_key(service_id, instance_id));
+            }
+        }
+    }
+
+    pub(crate) fn record_proxy_failure_inner(
+        &self,
+        service_id: &str,
+        instance_id: &str,
+        threshold: u32,
+    ) -> bool {
+        self.record_proxy_failure(service_id, instance_id, threshold)
+    }
+
+    pub(crate) fn record_proxy_success_inner(&self, service_id: &str, instance_id: &str) {
+        self.record_proxy_success(service_id, instance_id);
+    }
+
+    pub(crate) fn record_metrics_heartbeat_inner(&self, service_id: &str, instance_id: &str) {
+        self.record_metrics_heartbeat(service_id, instance_id);
+    }
+
+    pub(crate) fn evaluate_metrics_health_inner(&self, timeout: Duration) {
+        self.evaluate_metrics_health(timeout);
     }
 }
 
