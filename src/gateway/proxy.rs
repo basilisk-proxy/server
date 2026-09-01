@@ -365,12 +365,8 @@ impl ProxyHandler {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(path);
-        let target_uri = Self::prepare_target_uri(
-            &state,
-            &service,
-            request_path_and_query,
-            target_instance,
-        );
+        let target_uri =
+            Self::prepare_target_uri(&state, &service, request_path_and_query, target_instance);
 
         // Self-routing guard: reject immediately if the resolved target points back at
         // this gateway instance. This prevents tight routing loops without burning hop
@@ -404,6 +400,22 @@ impl ProxyHandler {
         .await;
         metrics.insert("proxy.send_upstream_request_ms".to_string(), send_ms);
         metrics.insert("proxy.wait_upstream_response_body_ms".to_string(), body_ms);
+
+        // When connection health is disabled (default), drive instance health from
+        // proxy reachability: N consecutive unreachable attempts → Down.
+        if !state.config.service_bus.connection_health_enabled {
+            let threshold = state.config.service_bus.proxy_failure_threshold;
+            let instance_id = target_instance.instance_id.clone();
+            if is_proxy_unreachable(&response, error_message.as_deref()) {
+                state
+                    .registry
+                    .record_proxy_failure(&service_id, &instance_id, threshold);
+            } else {
+                state
+                    .registry
+                    .record_proxy_success(&service_id, &instance_id);
+            }
+        }
 
         (response, error_message, metrics)
     }
@@ -997,6 +1009,18 @@ fn normalize_upstream_http_version(version: Version) -> Version {
     }
 }
 
+/// Determines whether a proxied response represents an unreachable upstream.
+///
+/// When the gateway itself could not establish a transport-level connection to
+/// the selected instance, `dispatch_upstream_request` returns `502 BAD_GATEWAY`
+/// with an error message. Upstream application-level 5xx responses also surface
+/// as `502` only when the gateway synthesizes the error, so we treat any
+/// `BAD_GATEWAY` with an error message as an unreachable signal for the
+/// proxy-based health path (active when `connection_health_enabled == false`).
+fn is_proxy_unreachable(response: &Response<Body>, error_message: Option<&str>) -> bool {
+    response.status() == StatusCode::BAD_GATEWAY && error_message.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,8 +1192,12 @@ mod tests {
             last_heartbeat_utc: chrono::Utc::now(),
         };
 
-        let target =
-            ProxyHandler::prepare_target_uri(&state, &service, "/api/ping?foo=bar&baz=1", &instance);
+        let target = ProxyHandler::prepare_target_uri(
+            &state,
+            &service,
+            "/api/ping?foo=bar&baz=1",
+            &instance,
+        );
 
         assert_eq!(target, "http://orders-svc/ping?foo=bar&baz=1");
     }

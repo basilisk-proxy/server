@@ -12,6 +12,7 @@ pub struct ServiceRegistry {
     services: DashMap<String, ServiceDefinition>,
     path_owners: DashMap<String, String>,
     metrics_heartbeat: DashMap<String, MetricsHeartbeatState>,
+    proxy_failure_counts: DashMap<String, u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +45,7 @@ impl ServiceRegistry {
             services: DashMap::new(),
             path_owners: DashMap::new(),
             metrics_heartbeat: DashMap::new(),
+            proxy_failure_counts: DashMap::new(),
         }
     }
 
@@ -163,6 +165,10 @@ impl ServiceRegistry {
         if let Some(mut service) = self.services.get_mut(service_id) {
             let removed = service.instances.remove(instance_id).is_some();
             if removed {
+                self.metrics_heartbeat
+                    .remove(&metrics_key(service_id, instance_id));
+                self.proxy_failure_counts
+                    .remove(&metrics_key(service_id, instance_id));
                 info!(
                     service_id = %service_id,
                     instance_id = %instance_id,
@@ -355,6 +361,8 @@ impl ServiceRegistry {
                         );
                         self.metrics_heartbeat
                             .remove(&metrics_key(&instance.service_id, &instance.instance_id));
+                        self.proxy_failure_counts
+                            .remove(&metrics_key(&instance.service_id, &instance.instance_id));
                         return false;
                     }
                 }
@@ -383,7 +391,85 @@ impl ServiceRegistry {
             if status == InstanceStatus::Up {
                 instance.last_heartbeat_utc = Utc::now();
             }
+            if status == InstanceStatus::Up || status == InstanceStatus::Down {
+                // Reset proxy failure tracking on explicit status transitions.
+                self.proxy_failure_counts
+                    .remove(&metrics_key(service_id, instance_id));
+            }
         }
+    }
+
+    /// Records a proxy failure for an instance when connection-health is disabled.
+    ///
+    /// Increments the consecutive failure counter and marks the instance `Down`
+    /// once `threshold` consecutive unreachable attempts are observed.
+    /// Returns `true` if the instance was transitioned to `Down` by this call.
+    pub fn record_proxy_failure(
+        &self,
+        service_id: &str,
+        instance_id: &str,
+        threshold: u32,
+    ) -> bool {
+        let threshold = threshold.max(1);
+        let key = metrics_key(service_id, instance_id);
+        let count = {
+            let mut entry = self.proxy_failure_counts.entry(key.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        if count >= threshold {
+            if let Some(mut service) = self.services.get_mut(service_id)
+                && let Some(instance) = service.instances.get_mut(instance_id)
+                && instance.status != InstanceStatus::Down
+            {
+                instance.status = InstanceStatus::Down;
+                warn!(
+                    service_id = %service_id,
+                    instance_id = %instance_id,
+                    consecutive_failures = count,
+                    threshold,
+                    "registry instance marked Down after consecutive proxy failures"
+                );
+            }
+            return true;
+        }
+
+        debug!(
+            service_id = %service_id,
+            instance_id = %instance_id,
+            consecutive_failures = count,
+            threshold,
+            "registry proxy failure recorded"
+        );
+        false
+    }
+
+    /// Records a successful proxy attempt, resetting the consecutive failure counter
+    /// and ensuring the instance is `Up`.
+    pub fn record_proxy_success(&self, service_id: &str, instance_id: &str) {
+        let key = metrics_key(service_id, instance_id);
+        self.proxy_failure_counts.remove(&key);
+        if let Some(mut service) = self.services.get_mut(service_id)
+            && let Some(instance) = service.instances.get_mut(instance_id)
+            && instance.status != InstanceStatus::Up
+        {
+            instance.status = InstanceStatus::Up;
+            instance.last_heartbeat_utc = Utc::now();
+            info!(
+                service_id = %service_id,
+                instance_id = %instance_id,
+                "registry instance marked Up after successful proxy"
+            );
+        }
+    }
+
+    /// Returns the current consecutive proxy failure count for an instance.
+    pub fn proxy_failure_count(&self, service_id: &str, instance_id: &str) -> u32 {
+        self.proxy_failure_counts
+            .get(&metrics_key(service_id, instance_id))
+            .map(|v| *v.value())
+            .unwrap_or(0)
     }
 }
 

@@ -20,20 +20,22 @@ pub struct InstanceData {
     pub last_heartbeat_utc: DateTime<Utc>,
 }
 
-
-
 impl ServiceData {
     pub fn from(source: &ServiceDefinition) -> Self {
-        let instances: HashMap<String, InstanceData> = HashMap::from_iter(source.instances.iter().map(|kv| {
-            let (_, instance) = kv;
-            return (instance.instance_id.clone(), InstanceData {
-                scheme: instance.scheme.clone(),
-                host: instance.host.clone(),
-                status: instance.status.clone(),
-                active_connections: instance.active_connections,
-                last_heartbeat_utc: instance.last_heartbeat_utc,
-            });
-        }));
+        let instances: HashMap<String, InstanceData> =
+            HashMap::from_iter(source.instances.iter().map(|kv| {
+                let (_, instance) = kv;
+                (
+                    instance.instance_id.clone(),
+                    InstanceData {
+                        scheme: instance.scheme.clone(),
+                        host: instance.host.clone(),
+                        status: instance.status,
+                        active_connections: instance.active_connections,
+                        last_heartbeat_utc: instance.last_heartbeat_utc,
+                    },
+                )
+            }));
 
         Self {
             service_id: source.service_id.clone(),

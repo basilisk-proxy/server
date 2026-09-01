@@ -1,3 +1,4 @@
+use crate::dto::ServiceData;
 use crate::gateway::AppState;
 use crate::lua_config::RequestConnectionInfo;
 use crate::models::{ErrorDetail, ErrorResponse, RegistrationRequest, error_codes};
@@ -11,7 +12,6 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use crate::dto::ServiceData;
 
 const REGISTRY_VERSION_CACHE_KEY: &str = "registry:version";
 
@@ -84,6 +84,21 @@ pub async fn register(
     let result = registry.register(request.clone()).await;
 
     if result.success {
+        // When proxy-based health is active (connection_health_enabled == false),
+        // instances are considered Up until proven unreachable via proxy failures.
+        // Mark the newly registered instance Up immediately so it can receive
+        // traffic without waiting for a bus liveness signal.
+        if !state.config.service_bus.connection_health_enabled
+            && let Some(ref instance_id) = result.instance_id
+        {
+            registry
+                .update_instance_status(
+                    &request.service_id,
+                    instance_id,
+                    crate::models::InstanceStatus::Up,
+                )
+                .await;
+        }
         info!(
             service_id = %request.service_id,
             instance_id = ?result.instance_id,
@@ -159,8 +174,11 @@ pub async fn deregister(
 
 /// Returns all currently registered services.
 pub async fn get_all_services(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let services: Vec<ServiceData> = state.registry.get_all_services().iter()
-        .map(|s| ServiceData::from(s))
+    let services: Vec<ServiceData> = state
+        .registry
+        .get_all_services()
+        .iter()
+        .map(ServiceData::from)
         .collect();
     debug!(
         services_count = services.len(),

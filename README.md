@@ -215,8 +215,9 @@ Runtime behavior notes:
 - `host(string)`
 - `port(number)`
 - `max_message_chars(number)`
-- `connection_health_enabled(boolean)` - if true, instance health is driven by bus auth/connect lifecycle
+- `connection_health_enabled(boolean)` - if true, instance health is driven by bus auth/connect lifecycle (default `false`)
 - `monitoring_enabled(boolean)` - if true, Basilisk monitors `basilisk.metrics.distribution`
+- `proxy_failure_threshold(number)` - when `connection_health_enabled` is `false`, instance is marked `Down` after this many consecutive unreachable proxy attempts (default `3`). Aliases: `connection_failure_threshold`, `failure_threshold`, `down_threshold`, `proxy_down_threshold`
 - `publish(topic, payloadJsonObjectString)`
 - `subscribe(topic, handlerFn)` - subscribes Lua runtime to a topic; handler receives `event`
 - `unsubscribe(topic)` - removes Lua handler and topic subscription for the runtime
@@ -227,10 +228,18 @@ Runtime behavior notes:
 The Lua runtime runs on a reserved bus identity (`service_id = "basilisk"`, `instance_id = "lua-runtime"`) that is
 pre-authenticated at startup.
 
-When `connection_health_enabled(true)` is set (default), connection lifecycle can drive health transitions:
+When `connection_health_enabled(true)` is set, connection lifecycle can drive health transitions:
 
 - successful `connect` with a valid token => instance marked `Up`
 - bus disconnect ⇒ instance marked `Down`
+
+When `connection_health_enabled(false)` is set (default), proxy reachability drives health transitions:
+
+- instance is initially `Up` after registration and remains `Up` until proven unreachable
+- each proxy attempt that cannot establish a transport-level connection to the selected instance counts as one failure
+- after `proxy_failure_threshold` (default `3`) consecutive unreachable attempts, the instance is marked `Down`
+- a successful proxied request resets the consecutive failure counter and marks the instance `Up`
+- configurable via `basilisk.service_bus.proxy_failure_threshold(N)` (aliases: `connection_failure_threshold`, `failure_threshold`, `down_threshold`, `proxy_down_threshold`)
 
 When `monitoring_enabled(true)` is also set, monitoring is authoritative and overrides immediate connection lifecycle
 transitions:
@@ -725,9 +734,10 @@ Forward response:
 
 Background task:
 
-- evaluates metrics heartbeat cadence
+- evaluates metrics heartbeat cadence when `monitoring_enabled(true)`
 - marks stale heartbeats as `Down` and irregular cadence as `Degraded`
 - removes stale down instances beyond timeout
+- when `connection_health_enabled(false)` (default), proxy reachability also drives health: consecutive unreachable upstream connections increment a per-instance counter and mark `Down` after `proxy_failure_threshold` attempts; successful proxy resets the counter
 
 ## 10. Common Use Cases
 

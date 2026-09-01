@@ -67,6 +67,14 @@ pub struct ObservabilityOptions {
     pub log_level: String,
 }
 
+fn default_proxy_failure_threshold() -> u32 {
+    3
+}
+
+fn default_connection_health_enabled() -> bool {
+    false
+}
+
 /// Service bus transport settings.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServiceBusOptions {
@@ -74,8 +82,11 @@ pub struct ServiceBusOptions {
     pub host: String,
     pub port: u16,
     pub max_message_chars: usize,
+    #[serde(default = "default_connection_health_enabled")]
     pub connection_health_enabled: bool,
     pub monitoring_enabled: bool,
+    #[serde(default = "default_proxy_failure_threshold")]
+    pub proxy_failure_threshold: u32,
 }
 
 impl Default for GatewayConfig {
@@ -119,8 +130,9 @@ impl Default for GatewayConfig {
                 host: "0.0.0.0".to_string(),
                 port: 5090,
                 max_message_chars: 65536,
-                connection_health_enabled: true,
+                connection_health_enabled: false,
                 monitoring_enabled: true,
+                proxy_failure_threshold: 3,
             },
         }
     }

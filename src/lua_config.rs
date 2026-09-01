@@ -1586,6 +1586,66 @@ fn make_service_bus_api(
         })?,
     )?;
 
+    // Configurable Down threshold for proxy-based health when connection_health is disabled.
+    // Instance is considered Down after N consecutive unreachable proxy attempts.
+    // Primary name: proxy_failure_threshold
+    // Aliases provided for discoverability: connection_failure_threshold, failure_threshold,
+    // down_threshold, proxy_down_threshold
+    let cfg = Arc::clone(&config);
+    table.set(
+        "proxy_failure_threshold",
+        lua.create_function(move |_, threshold: u32| {
+            if threshold == 0 {
+                return Err(mlua::Error::external(
+                    "proxy_failure_threshold must be >= 1",
+                ));
+            }
+            with_config_mut(&cfg, |c| c.service_bus.proxy_failure_threshold = threshold)
+        })?,
+    )?;
+    let cfg = Arc::clone(&config);
+    table.set(
+        "connection_failure_threshold",
+        lua.create_function(move |_, threshold: u32| {
+            if threshold == 0 {
+                return Err(mlua::Error::external(
+                    "connection_failure_threshold must be >= 1",
+                ));
+            }
+            with_config_mut(&cfg, |c| c.service_bus.proxy_failure_threshold = threshold)
+        })?,
+    )?;
+    let cfg = Arc::clone(&config);
+    table.set(
+        "failure_threshold",
+        lua.create_function(move |_, threshold: u32| {
+            if threshold == 0 {
+                return Err(mlua::Error::external("failure_threshold must be >= 1"));
+            }
+            with_config_mut(&cfg, |c| c.service_bus.proxy_failure_threshold = threshold)
+        })?,
+    )?;
+    let cfg = Arc::clone(&config);
+    table.set(
+        "down_threshold",
+        lua.create_function(move |_, threshold: u32| {
+            if threshold == 0 {
+                return Err(mlua::Error::external("down_threshold must be >= 1"));
+            }
+            with_config_mut(&cfg, |c| c.service_bus.proxy_failure_threshold = threshold)
+        })?,
+    )?;
+    let cfg = Arc::clone(&config);
+    table.set(
+        "proxy_down_threshold",
+        lua.create_function(move |_, threshold: u32| {
+            if threshold == 0 {
+                return Err(mlua::Error::external("proxy_down_threshold must be >= 1"));
+            }
+            with_config_mut(&cfg, |c| c.service_bus.proxy_failure_threshold = threshold)
+        })?,
+    )?;
+
     let cm = Arc::clone(&connection_manager);
     table.set(
         "publish",

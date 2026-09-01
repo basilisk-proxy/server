@@ -49,6 +49,7 @@ async fn start_test_bus_server_with_state(
     config.service_bus.host = "127.0.0.1".to_string();
     config.service_bus.port = port;
     config.service_bus.monitoring_enabled = monitoring_enabled;
+    config.service_bus.connection_health_enabled = true;
     let handle = tokio::spawn(async move { run_server(config, manager, registry).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     handle
