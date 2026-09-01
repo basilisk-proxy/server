@@ -133,9 +133,7 @@ impl ServiceRegistry {
             host: request.instance.host,
             port: request.instance.port,
             weight: request.instance.weight,
-            // Instance is considered healthy only after service-bus/metrics liveness
-            // evidence, not immediately at registration time.
-            status: InstanceStatus::Down,
+            status: InstanceStatus::Up,
             active_connections: 0,
             last_heartbeat_utc: Utc::now(),
         };

@@ -352,7 +352,7 @@ async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() 
         .instances
         .get("orders-1")
         .expect("orders-1 should exist after register");
-    assert_eq!(instance.status, InstanceStatus::Down);
+    assert_eq!(instance.status, InstanceStatus::Up);
 
     let handle =
         start_test_bus_server_with_state(port, Arc::clone(&manager), Arc::clone(&registry), false)

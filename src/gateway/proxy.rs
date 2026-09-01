@@ -493,6 +493,30 @@ impl ProxyHandler {
             .collect();
 
         if healthy_instances.is_empty() {
+            // When proxy-based health is active (connection_health_enabled == false),
+            // instances start Up and are only marked Down after consecutive proxy
+            // failures. To allow recovery, if no Up is available, fallback to any
+            // instance (including Down) so a successful downstream can mark it Up
+            // again via record_proxy_success.
+            if !state.config.service_bus.connection_health_enabled && !service.instances.is_empty()
+            {
+                let fallback: SmallVec<[&ServiceInstance; 8]> =
+                    service.instances.values().collect();
+                let strategy = state
+                    .config
+                    .routing
+                    .default_load_balancing_strategy
+                    .as_str();
+                let target = match strategy {
+                    "WEIGHTED_ROUND_ROBIN" => {
+                        self.pick_weighted_round_robin(state, service_id, &fallback)
+                    }
+                    "WEIGHTED_RANDOM" => self.pick_weighted_random(&fallback),
+                    "IP_HASH" => self.pick_ip_hash(address, &fallback),
+                    _ => self.pick_round_robin(state, service_id, &fallback),
+                };
+                return Ok(target);
+            }
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No healthy instances available",
@@ -1075,7 +1099,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_proxy_no_healthy_instances() {
-        let state = test_state();
+        // This test verifies the explicit no-healthy path (503) which applies
+        // when connection health is authoritative. Use health-enabled config
+        // so Down is not retried via proxy fallback.
+        let registry = Arc::new(ServiceRegistry::new());
+        let mut config = GatewayConfig::default();
+        config.service_bus.connection_health_enabled = true;
+        let state = Arc::new(AppState {
+            config,
+            gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            registry,
+            connection_manager: Arc::new(ConnectionManager::new()),
+            proxy_handler: ProxyHandler::new(),
+            lua_runtime: LuaRuntime::allow_all(),
+            cache: Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init")),
+            upstream_client: new_upstream_http_client(),
+            telemetry: Arc::new(RuntimeTelemetry::new()),
+        });
 
         let service_id = "test-service".to_string();
         state

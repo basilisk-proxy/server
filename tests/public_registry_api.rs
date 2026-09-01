@@ -38,7 +38,7 @@ async fn register_and_deregister_work_for_public_registry_api() {
         .instances
         .get(&instance_id)
         .expect("generated instance should exist");
-    assert_eq!(instance.status, InstanceStatus::Down);
+    assert_eq!(instance.status, InstanceStatus::Up);
 
     let token = result.token.expect("registration must return token");
     assert!(registry.validate_instance_token("orders", &instance_id, &token));
