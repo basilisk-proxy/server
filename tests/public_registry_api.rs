@@ -16,6 +16,7 @@ fn registration_request(service_id: &str, path_prefixes: Vec<&str>) -> Registrat
         auth: AuthInfo {
             r#type: "token".to_string(),
             token: "token".to_string(),
+            signature: None,
         },
     }
 }

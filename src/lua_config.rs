@@ -25,6 +25,7 @@ pub struct LuaRuntime {
     before_middlewares: Mutex<Vec<MiddlewareMount>>,
     after_middlewares: Mutex<Vec<MiddlewareMount>>,
     static_forward_mounts: Mutex<Vec<StaticForwardMount>>,
+    dynamic_forward_mounts: Mutex<Vec<DynamicForwardMount>>,
     registration_allowlist_rules: Mutex<Vec<RegistryKey>>,
     /// Registered service-bus event handlers: topic → handler key.
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
@@ -43,6 +44,22 @@ struct StaticForwardMount {
     route_id: String,
     matcher: MiddlewareMatcher,
     upstreams: Vec<StaticForwardUpstream>,
+}
+
+/// Mount that delegates route resolution to a Lua resolver handler.
+struct DynamicForwardMount {
+    route_id: String,
+    path_prefix: String,
+    resolver_key: RegistryKey,
+}
+
+/// Outcome of dynamic forward resolution for a request.
+#[derive(Debug, Clone)]
+pub struct DynamicForwardResolution {
+    pub route_id: String,
+    pub matched_prefix: String,
+    /// Service name passed to `resolve(...)` by the Lua resolver handler.
+    pub service_id: String,
 }
 
 #[derive(Clone)]
@@ -69,6 +86,7 @@ struct PrimitiveContext {
     before_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
     after_middleware_mounts: Arc<Mutex<Vec<MiddlewareMount>>>,
     static_forward_mounts: Arc<Mutex<Vec<StaticForwardMount>>>,
+    dynamic_forward_mounts: Arc<Mutex<Vec<DynamicForwardMount>>>,
     registration_allowlist_rules: Arc<Mutex<Vec<RegistryKey>>>,
     event_handlers: Arc<Mutex<HashMap<String, RegistryKey>>>,
 }
@@ -173,6 +191,7 @@ pub fn load_config_and_runtime(
     let before_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
     let after_middleware_mounts = Arc::new(Mutex::new(Vec::<MiddlewareMount>::new()));
     let static_forward_mounts = Arc::new(Mutex::new(Vec::<StaticForwardMount>::new()));
+    let dynamic_forward_mounts = Arc::new(Mutex::new(Vec::<DynamicForwardMount>::new()));
     let registration_allowlist_rules = Arc::new(Mutex::new(Vec::<RegistryKey>::new()));
     let config_state = Arc::new(Mutex::new(GatewayConfig::default()));
     let cache = Arc::new(GatewayCache::new("memory")?);
@@ -187,6 +206,7 @@ pub fn load_config_and_runtime(
         before_middleware_mounts: Arc::clone(&before_middleware_mounts),
         after_middleware_mounts: Arc::clone(&after_middleware_mounts),
         static_forward_mounts: Arc::clone(&static_forward_mounts),
+        dynamic_forward_mounts: Arc::clone(&dynamic_forward_mounts),
         registration_allowlist_rules: Arc::clone(&registration_allowlist_rules),
         event_handlers: Arc::clone(&event_handlers),
     };
@@ -245,6 +265,13 @@ pub fn load_config_and_runtime(
                 .drain(..)
                 .collect(),
         ),
+        dynamic_forward_mounts: Mutex::new(
+            dynamic_forward_mounts
+                .lock()
+                .map_err(|_| anyhow!("Lua dynamic forward lock poisoned"))?
+                .drain(..)
+                .collect(),
+        ),
         registration_allowlist_rules: Mutex::new(
             registration_allowlist_rules
                 .lock()
@@ -293,6 +320,7 @@ impl LuaRuntime {
             before_middlewares: Mutex::new(Vec::new()),
             after_middlewares: Mutex::new(Vec::new()),
             static_forward_mounts: Mutex::new(Vec::new()),
+            dynamic_forward_mounts: Mutex::new(Vec::new()),
             registration_allowlist_rules: Mutex::new(Vec::new()),
             event_handlers: Arc::new(Mutex::new(HashMap::new())),
             event_dispatch_tx,
@@ -556,6 +584,80 @@ impl LuaRuntime {
                 reachable_upstreams: reachable_targets.len(),
                 reachable_targets,
             }));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolves a dynamically mounted route resolver if one matches.
+    ///
+    /// For each `basilisk.registry.bind_path` mount whose prefix matches the
+    /// request path, the resolver handler is invoked as `resolver(req, resolve)`.
+    /// The first mount that calls `resolve(service_name)` wins and the returned
+    /// service name is used for registry instance selection. Mounts that match
+    /// but do not call `resolve` fall through to the next mount and finally to
+    /// registry path resolution.
+    pub fn resolve_dynamic_forward(
+        &self,
+        path: &str,
+        method: &str,
+        headers: &HeaderMap,
+        connection_info: &RequestConnectionInfo,
+    ) -> anyhow::Result<Option<DynamicForwardResolution>> {
+        let lua = self
+            .lua
+            .lock()
+            .map_err(|_| anyhow!("Lua runtime lock poisoned"))?;
+        let mounts = self
+            .dynamic_forward_mounts
+            .lock()
+            .map_err(|_| anyhow!("Lua dynamic forward lock poisoned"))?;
+        let host = extract_host(headers);
+
+        for mount in mounts.iter() {
+            if !path.starts_with(&mount.path_prefix) {
+                continue;
+            }
+
+            let resolved = Arc::new(Mutex::new(None::<String>));
+            let req = build_matcher_req_table(&lua, path, method, headers, &host, connection_info)
+                .map_err(lua_to_anyhow)?;
+            let shared_context = lua.create_table().map_err(lua_to_anyhow)?;
+            req.set("ctx", shared_context).map_err(lua_to_anyhow)?;
+
+            let resolved_for_closure = Arc::clone(&resolved);
+            let resolve_fn = lua
+                .create_function(move |_, target: String| {
+                    *resolved_for_closure.lock().map_err(|_| {
+                        mlua::Error::external("dynamic resolver state lock poisoned")
+                    })? = Some(target);
+                    Ok(())
+                })
+                .map_err(lua_to_anyhow)?;
+
+            let resolver: Function = lua
+                .registry_value(&mount.resolver_key)
+                .map_err(lua_to_anyhow)?;
+
+            if let Err(err) = resolver.call::<()>((req, resolve_fn)) {
+                return Err(anyhow!(
+                    "Lua dynamic forward resolver failed for mount '{}': {err}",
+                    mount.route_id
+                ));
+            }
+
+            let resolved_service = resolved
+                .lock()
+                .map_err(|_| anyhow!("Lua dynamic forward state lock poisoned"))?
+                .clone()
+                .filter(|target| !target.trim().is_empty());
+            if let Some(service_id) = resolved_service {
+                return Ok(Some(DynamicForwardResolution {
+                    route_id: mount.route_id.clone(),
+                    matched_prefix: mount.path_prefix.clone(),
+                    service_id,
+                }));
+            }
         }
 
         Ok(None)
@@ -894,6 +996,7 @@ fn register_primitives(lua: &Lua, context: &PrimitiveContext) -> LuaResult<()> {
         "observability",
         make_observability_api(lua, Arc::clone(&context.config))?,
     )?;
+    basilisk.set("log", make_log_api(lua)?)?;
     basilisk.set(
         "service_bus",
         make_service_bus_api(
@@ -905,7 +1008,11 @@ fn register_primitives(lua: &Lua, context: &PrimitiveContext) -> LuaResult<()> {
     )?;
     basilisk.set(
         "registry",
-        make_registry_api(lua, Arc::clone(&context.registry))?,
+        make_registry_api(
+            lua,
+            Arc::clone(&context.registry),
+            Arc::clone(&context.dynamic_forward_mounts),
+        )?,
     )?;
     basilisk.set(
         "proxy",
@@ -1054,6 +1161,19 @@ fn make_cache_api(
         "strategy",
         lua.create_function(move |_, strategy: String| {
             with_config_mut(&cfg, |c| c.cache.strategy = strategy)
+        })?,
+    )?;
+
+    let cfg = Arc::clone(&config);
+    table.set(
+        "max_response_entries",
+        lua.create_function(move |_, max_entries: usize| {
+            if max_entries == 0 {
+                return Err(mlua::Error::external(
+                    "cache.max_response_entries must be >= 1",
+                ));
+            }
+            with_config_mut(&cfg, |c| c.cache.response_cache_max_entries = max_entries)
         })?,
     )?;
 
@@ -1436,6 +1556,26 @@ fn make_security_api(
         })?,
     )?;
 
+    // registration_public_key(serviceId, publicKey) — provision the known
+    // Ed25519 public key for a service, used for KEY_PAIR registration
+    // authentication. Keys are base64-encoded (URL-safe, no padding).
+    let cfg = Arc::clone(&config);
+    table.set(
+        "registration_public_key",
+        lua.create_function(move |_, (service_id, public_key): (String, String)| {
+            if service_id.trim().is_empty() {
+                return Err(mlua::Error::external(
+                    "security.registration_public_key requires a non-empty service id",
+                ));
+            }
+            with_config_mut(&cfg, |c| {
+                c.security
+                    .registration_public_keys
+                    .insert(service_id, public_key);
+            })
+        })?,
+    )?;
+
     let rules = Arc::clone(&registration_allowlist_rules);
     table.set(
         "registration_allowlist",
@@ -1528,6 +1668,165 @@ fn make_observability_api(lua: &Lua, config: Arc<Mutex<GatewayConfig>>) -> LuaRe
     )?;
 
     Ok(table)
+}
+
+const LOG_TARGET: &str = "basilisk::lua";
+
+fn make_log_api(lua: &Lua) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+
+    macro_rules! lua_log_level {
+        ($name:literal, $level_macro:ident) => {
+            let level_function = lua.create_function(|lua, (format, args): (String, MultiValue)| {
+                let values: Vec<Value> = args.into_iter().collect();
+                // Logging must never break Lua execution (middleware, resolvers,
+                // bus handlers rely on it); on a formatting problem emit a
+                // diagnostic event carrying the original format string instead
+                // of raising an error.
+                match format_log_message(lua, &format, &values) {
+                    Ok(message) => {
+                        tracing::$level_macro!(target: LOG_TARGET, "{}", message);
+                    }
+                    Err(err) => {
+                        tracing::$level_macro!(
+                            target: LOG_TARGET,
+                            "log formatting failed: {}; format string: {}",
+                            err,
+                            format
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+            table.set($name, level_function)?;
+        };
+    }
+
+    lua_log_level!("trace", trace);
+    lua_log_level!("debug", debug);
+    lua_log_level!("info", info);
+    lua_log_level!("warn", warn);
+    lua_log_level!("error", error);
+
+    Ok(table)
+}
+
+/// Renders a Lua value for log interpolation with Rust-compatible semantics.
+fn render_log_value(lua: &Lua, value: &Value) -> LuaResult<String> {
+    match value {
+        Value::Nil => Ok("nil".to_string()),
+        Value::Boolean(value) => Ok(value.to_string()),
+        Value::Integer(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(value.to_str()?.to_string()),
+        _ => {
+            let tostring: Function = lua.globals().get("tostring")?;
+            tostring.call(value.clone())
+        }
+    }
+}
+
+/// Formats a Lua log format string using Rust formatting-syntax placeholders:
+/// `{}` (sequential), `{index}` (positional) and `{name}` (looked up in a
+/// trailing Lua table argument). `{{` and `}}` escape literal braces. Format
+/// specifications (`{value:>10}`) are rejected so callers pre-format values.
+fn format_log_message(lua: &Lua, format: &str, args: &[Value]) -> LuaResult<String> {
+    let named_table = match args.last() {
+        Some(Value::Table(table)) => Some(table),
+        _ => None,
+    };
+    let positional_len = if named_table.is_some() {
+        args.len() - 1
+    } else {
+        args.len()
+    };
+    let positional_args = &args[..positional_len];
+
+    let chars: Vec<char> = format.chars().collect();
+    let mut message = String::with_capacity(format.len() + 16);
+    let mut next_positional = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let current = chars[index];
+        match current {
+            '{' => {
+                if chars.get(index + 1) == Some(&'{') {
+                    message.push('{');
+                    index += 2;
+                    continue;
+                }
+                let mut cursor = index + 1;
+                while cursor < chars.len() && chars[cursor] != '}' {
+                    cursor += 1;
+                }
+                if cursor == chars.len() {
+                    return Err(mlua::Error::external(format!(
+                        "log formatting requires a closing brace for '{{' at character {index}"
+                    )));
+                }
+                let token: String = chars[index + 1..cursor].iter().collect();
+                if token.contains(':') {
+                    return Err(mlua::Error::external(format!(
+                        "log formatting does not support format specifications ('{token}'); format the value in Lua before logging"
+                    )));
+                }
+                let token = token.trim();
+                let rendered = if token.is_empty() {
+                    let value = positional_args.get(next_positional).ok_or_else(|| {
+                        mlua::Error::external(
+                            "log formatting ran out of positional arguments for '{}'",
+                        )
+                    })?;
+                    let rendered = render_log_value(lua, value)?;
+                    next_positional += 1;
+                    rendered
+                } else if token.chars().all(|c| c.is_ascii_digit()) {
+                    let argument_index: usize = token.parse().map_err(|_| {
+                        mlua::Error::external(format!("invalid log argument index '{token}'"))
+                    })?;
+                    let value = positional_args.get(argument_index).ok_or_else(|| {
+                        mlua::Error::external(format!(
+                            "log formatting argument index {argument_index} is out of range"
+                        ))
+                    })?;
+                    render_log_value(lua, value)?
+                } else {
+                    let table = named_table.ok_or_else(|| {
+                        mlua::Error::external(format!(
+                            "log formatting requires a trailing table argument to resolve named placeholder '{token}'"
+                        ))
+                    })?;
+                    let found: Option<Value> = table.raw_get(token)?;
+                    match found {
+                        Some(value) => render_log_value(lua, &value)?,
+                        None => {
+                            return Err(mlua::Error::external(format!(
+                                "log formatting has no field '{token}' in the trailing table argument"
+                            )));
+                        }
+                    }
+                };
+                message.push_str(&rendered);
+                index = cursor + 1;
+            }
+            '}' => {
+                if chars.get(index + 1) == Some(&'}') {
+                    message.push('}');
+                    index += 2;
+                    continue;
+                }
+                message.push('}');
+                index += 1;
+            }
+            _ => {
+                message.push(current);
+                index += 1;
+            }
+        }
+    }
+
+    Ok(message)
 }
 
 fn make_service_bus_api(
@@ -1775,7 +2074,11 @@ fn make_service_bus_api(
     Ok(table)
 }
 
-fn make_registry_api(lua: &Lua, registry: Arc<ServiceRegistry>) -> LuaResult<Table> {
+fn make_registry_api(
+    lua: &Lua,
+    registry: Arc<ServiceRegistry>,
+    dynamic_forward_mounts: Arc<Mutex<Vec<DynamicForwardMount>>>,
+) -> LuaResult<Table> {
     let table = lua.create_table()?;
 
     let reg = Arc::clone(&registry);
@@ -1792,12 +2095,49 @@ fn make_registry_api(lua: &Lua, registry: Arc<ServiceRegistry>) -> LuaResult<Tab
         })?,
     )?;
 
+    // bind_path(path_prefix, serviceId | resolverFn):
+    // - with a service id string, binds the prefix to the service in the
+    //   registry for static route resolution.
+    // - with a resolver function, mounts a dynamic resolver handler invoked as
+    //   `resolver(req, resolve)`, where calling `resolve(service_name)` routes
+    //   the matched request to the named service.
     let reg = Arc::clone(&registry);
+    let mounts = Arc::clone(&dynamic_forward_mounts);
     table.set(
         "bind_path",
-        lua.create_function(move |_, (path_prefix, service_id): (String, String)| {
-            reg.bind_path_prefix(path_prefix, service_id);
-            Ok(())
+        lua.create_function(move |lua, (path_prefix, target): (String, Value)| {
+            if path_prefix.trim().is_empty() {
+                return Err(mlua::Error::external(
+                    "registry.bind_path requires a non-empty path prefix",
+                ));
+            }
+            match target {
+                Value::String(service_id) => {
+                    if service_id.to_str()?.trim().is_empty() {
+                        return Err(mlua::Error::external(
+                            "registry.bind_path requires a non-empty service id",
+                        ));
+                    }
+                    reg.bind_path_prefix(path_prefix, service_id.to_str()?.to_string());
+                    Ok(())
+                }
+                Value::Function(resolver) => {
+                    let resolver_key = lua.create_registry_value(resolver)?;
+                    let route_id = format!("dynamic-forward-{}", Uuid::now_v7());
+                    mounts
+                        .lock()
+                        .map_err(|_| mlua::Error::external("Lua dynamic forward lock poisoned"))?
+                        .push(DynamicForwardMount {
+                            route_id,
+                            path_prefix,
+                            resolver_key,
+                        });
+                    Ok(())
+                }
+                _ => Err(mlua::Error::external(
+                    "registry.bind_path expects a service id string or a resolver function",
+                )),
+            }
         })?,
     )?;
 
@@ -2595,12 +2935,14 @@ fn cache_to_lua_error(err: anyhow::Error) -> mlua::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::format_log_message;
     use super::load_config_and_runtime;
     use crate::registry::ServiceRegistry;
     use crate::service_bus::connection_manager::ConnectionManager;
     use axum::http::HeaderMap;
+    use mlua::{Lua, Value};
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     fn test_dir(name: &str) -> std::path::PathBuf {
@@ -2660,6 +3002,230 @@ mod tests {
 
         assert_eq!(rejection.status, 403);
         assert_eq!(rejection.body, "blocked");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn sample_args(lua: &Lua) -> Vec<Value> {
+        vec![
+            Value::Integer(7),
+            Value::String(lua.create_string("orders-1").expect("string")),
+        ]
+    }
+
+    #[test]
+    fn log_format_supports_sequential_and_indexed_placeholders() {
+        let lua = Lua::new();
+        let args = sample_args(&lua);
+
+        assert_eq!(
+            format_log_message(&lua, "instance {} handled {} requests", &args).expect("formatted"),
+            "instance 7 handled orders-1 requests"
+        );
+        assert_eq!(
+            format_log_message(&lua, "instance {1} triggered {0}", &args).expect("formatted"),
+            "instance orders-1 triggered 7"
+        );
+        assert_eq!(
+            format_log_message(&lua, "braces {{}} stay {}", &args).expect("formatted"),
+            "braces {} stay 7"
+        );
+        assert_eq!(
+            format_log_message(&lua, "plain message", &[]).expect("formatted"),
+            "plain message"
+        );
+        assert_eq!(
+            format_log_message(&lua, "no args {}", &[Value::Nil]).expect("formatted"),
+            "no args nil"
+        );
+    }
+
+    #[test]
+    fn log_format_resolves_named_placeholders_from_trailing_table() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        table.set("service", "orders").expect("set");
+        table.set("port", 8080).expect("set");
+        let args: Vec<Value> = vec![Value::Integer(8080), Value::Table(table)];
+
+        assert_eq!(
+            format_log_message(&lua, "started {service} with {port} workers", &args)
+                .expect("formatted"),
+            "started orders with 8080 workers"
+        );
+    }
+
+    #[test]
+    fn log_format_rejects_misused_placeholders() {
+        let lua = Lua::new();
+        let args = sample_args(&lua);
+
+        let missing = format_log_message(&lua, "needs {} {} {}", &args).expect_err("missing args");
+        assert!(
+            missing
+                .to_string()
+                .contains("ran out of positional arguments")
+        );
+
+        let range = format_log_message(&lua, "needs {9}", &args).expect_err("out of range");
+        assert!(range.to_string().contains("out of range"));
+
+        let spec = format_log_message(&lua, "number {:>10}", &args).expect_err("format spec");
+        assert!(
+            spec.to_string()
+                .contains("does not support format specifications")
+        );
+
+        let named = format_log_message(&lua, "needs {service}", &args).expect_err("missing table");
+        assert!(named.to_string().contains("trailing table argument"));
+
+        let lua2 = Lua::new();
+        let table = lua2.create_table().expect("table");
+        let table_args: Vec<Value> = vec![Value::Table(table)];
+        let unknown_field =
+            format_log_message(&lua2, "needs {missing}", &table_args).expect_err("unknown field");
+        assert!(unknown_field.to_string().contains("no field 'missing'"));
+    }
+
+    #[derive(Clone)]
+    struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lua_log_api_emits_tracing_events() {
+        let dir = test_dir("logging");
+        let script = dir.join("basilisk.lua");
+        fs::write(
+            &script,
+            "basilisk.proxy.use(function(req, res, next)\n\
+             \x20 basilisk.log.info('instance {} booted', 'orders-1')\n\
+             \x20 basilisk.log.warn('memory {threshold} MB used', { threshold = 90 })\n\
+             \x20 basilisk.log.error('no args needed')\n\
+             \x20 basilisk.log.debug('routed {} {}', 'GET', '/api/orders')\n\
+             \x20 basilisk.log.trace('trace level works too')\n\
+             \x20 return next()\n\
+             end)\n",
+        )
+        .expect("failed to write logging script");
+
+        let registry = Arc::new(ServiceRegistry::new());
+        let connection_manager = Arc::new(ConnectionManager::new());
+
+        let (_config, runtime, _cache) =
+            load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
+                .expect("failed to load runtime");
+
+        let sink = LogSink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(sink.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime
+                .run_middlewares("/api/anything", "GET", &HeaderMap::new())
+                .expect("middleware execution failed");
+        });
+
+        let output = String::from_utf8(sink.0.lock().expect("log sink lock").clone())
+            .expect("log output utf8");
+        assert!(
+            output.contains("instance orders-1 booted"),
+            "output: {output}"
+        );
+        assert!(output.contains("memory 90 MB used"), "output: {output}");
+        assert!(output.contains("no args needed"), "output: {output}");
+        assert!(
+            output.contains("routed GET /api/orders"),
+            "output: {output}"
+        );
+        assert!(output.contains("trace level works too"), "output: {output}");
+        assert!(output.contains("INFO"), "output: {output}");
+        assert!(output.contains("WARN"), "output: {output}");
+        assert!(output.contains("ERROR"), "output: {output}");
+        assert!(output.contains("DEBUG"), "output: {output}");
+        assert!(output.contains("TRACE"), "output: {output}");
+        assert!(output.contains("basilisk::lua"), "output: {output}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lua_log_api_degrades_gracefully_on_format_errors() {
+        let dir = test_dir("logging-degrade");
+        let script = dir.join("basilisk.lua");
+        fs::write(
+            &script,
+            "basilisk.proxy.use(function(req, res, next)\n\
+             \x20 basilisk.log.info('needs {} {}', 'only-one-arg')\n\
+             \x20 basilisk.log.error('unknown {token}', { other = true })\n\
+             \x20 basilisk.log.warn('spec {:>10}', 5)\n\
+             \x20 return next()\n\
+             end)\n",
+        )
+        .expect("failed to write logging script");
+
+        let registry = Arc::new(ServiceRegistry::new());
+        let connection_manager = Arc::new(ConnectionManager::new());
+
+        let (_config, runtime, _cache) =
+            load_config_and_runtime(&script.to_string_lossy(), registry, connection_manager)
+                .expect("failed to load runtime");
+
+        let sink = LogSink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(sink.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let result = runtime
+                .run_middlewares("/api/anything", "GET", &HeaderMap::new())
+                .expect("malformed log calls must not fail middleware execution");
+            assert!(
+                result.short_circuit_response.is_none(),
+                "middleware must continue past malformed log calls"
+            );
+        });
+
+        let output = String::from_utf8(sink.0.lock().expect("log sink lock").clone())
+            .expect("log output utf8");
+        assert!(
+            output
+                .contains("log formatting failed: log formatting ran out of positional arguments"),
+            "output: {output}"
+        );
+        assert!(output.contains("no field 'token'"), "output: {output}");
+        assert!(
+            output.contains("does not support format specifications"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("format string: needs {} {}"),
+            "output: {output}"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

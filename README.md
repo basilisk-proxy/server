@@ -23,8 +23,8 @@ The runtime is configured from a single Lua entry file passed on process startup
 - [9. Request Flow](#9-request-flow)
 - [10. Common Use Cases](#10-common-use-cases)
 - [11. Testing](#11-testing)
-    - [11.1 Benchmark pipeline](#111-benchmark-pipeline)
-    - [11.2 Benchmark results](#112-benchmark-results)
+  - [11.1 Benchmark pipeline](#111-benchmark-pipeline)
+  - [11.2 Benchmark results](#112-benchmark-results)
 - [12. Operational Notes](#12-operational-notes)
 - [13. Troubleshooting](#13-troubleshooting)
 
@@ -50,16 +50,16 @@ Core modules:
 - `src/cache/`: provider-agnostic cache trait plus private backend strategies
 - `src/lua_config.rs`: Lua VM bootstrap, primitive registration, middleware execution
 - `src/gateway/`:
-    - `mod.rs`: `AppState`
-    - `routes.rs`: HTTP registry handlers
-    - `proxy.rs`: reverse proxy handler and load-balancing
+  - `mod.rs`: `AppState`
+  - `routes.rs`: HTTP registry handlers
+  - `proxy.rs`: reverse proxy handler and load-balancing
 - `src/registry/`:
-    - `mod.rs`: service registry storage and APIs
-    - `maintenance.rs`: metrics heartbeat evaluation and stale cleanup loop
+  - `mod.rs`: service registry storage and APIs
+  - `maintenance.rs`: metrics heartbeat evaluation and stale cleanup loop
 - `src/service_bus/`:
-    - `contracts.rs`: protocol message types
-    - `connection_manager.rs`: in-memory connection/subscription manager
-    - `server.rs`: TCP protocol server
+  - `contracts.rs`: protocol message types
+  - `connection_manager.rs`: in-memory connection/subscription manager
+  - `server.rs`: TCP protocol server
 - `tests/`: top-level integration tests for public APIs
 
 ## 3. Runtime Model
@@ -87,7 +87,7 @@ If missing or extra arguments are provided, the startup fails with usage help.
 Basilisk sets Lua's `package.path` to `<entry-root>/modules/?.lua` at startup. Files in that directory can be loaded
 with standard `require`:
 
-```
+```text
 basilisk.lua
 modules/
   auth.lua
@@ -169,7 +169,7 @@ basilisk.service_bus.port(5090)
 `basilisk.gateway`
 
 - `load_balancing_strategy(string)`
-    - Supported values in proxy selection: `ROUND_ROBIN`, `WEIGHTED_ROUND_ROBIN`, `WEIGHTED_RANDOM`, `IP_HASH`
+  - Supported values in proxy selection: `ROUND_ROBIN`, `WEIGHTED_ROUND_ROBIN`, `WEIGHTED_RANDOM`, `IP_HASH`
 - `strip_prefix(boolean)`
 
 `basilisk.cache`
@@ -180,6 +180,7 @@ basilisk.service_bus.port(5090)
 - `service_resolution_ttl_seconds(number)` - TTL for proxy path-resolution cache entries
 - `ttl_seconds(number)` - compatibility alias for `service_resolution_ttl_seconds`
 - `strategy(string)`
+- `max_response_entries(number)` - maximum number of proxied responses kept in the response cache (default `1024`)
 - `get(key)` / `set(key, value)` / `delete(key)` / `exists(key)` / `keys()`
 - list / set / hash helpers (`list_*`, `set_*`, `hash_*`) and numeric helpers (`incr`, `decr`)
 
@@ -190,12 +191,28 @@ Runtime behavior notes:
 - Basilisk-owned internal gateway keys stay isolated in the internal namespace and are filtered from
   `basilisk.cache.keys()`.
 
+Proxied response caching:
+
+- When caching is enabled, full proxied responses may be stored when the upstream responds with the
+  `x-basilisk-cache` header set to `enabled,<ttlSeconds>,<evictionPolicy>`.
+- The third value is optional and defaults to `LRU`. Supported eviction policies: `LRU`, `LFU`, `FIFO`, `LIFO`, `MRU`, `ARC`, `RANDOM`.
+- `x-basilisk-cache: disabled` opts a response out and leaves existing entries untouched.
+- Responses are cached per `method + path + query`. Only responses with status `< 400` and a body up to 2 MiB are stored.
+- Proxied responses carry `x-basilisk-cache-status: hit` when served from cache and `miss` when served fresh.
+- Cached entries live in the Basilisk-owned internal cache namespace and are never exposed to Lua middleware keys.
+
 `basilisk.security`
 
-- `service_registration_auth(string)`
+- `service_registration_auth(string)` - `TOKEN` (default) or `KEY_PAIR`
 - `registration_token(string)`
+- `registration_public_key(serviceId, publicKey)` - provisions the Ed25519 public key used to verify signatures when
+  `service_registration_auth('KEY_PAIR')` is active; keys are base64 (URL-safe, no padding)
 - `registration_allowlist(ruleFn | {ruleFn1, ruleFn2, ...})`
 - `registration_whitelist(ruleFn | {ruleFn1, ruleFn2, ...})` (alias)
+
+When `service_registration_auth('KEY_PAIR')` is set, registering a service requires `auth.type = "key_pair"` and an
+`auth.signature` that is an Ed25519 signature (base64, URL-safe, no padding) over the exact `serviceId` bytes, verifiable
+with the provisioned public key. Missing keys or invalid signatures are rejected with `401 AUTH_FAILED`.
 
 `basilisk.observability`
 
@@ -203,9 +220,40 @@ Runtime behavior notes:
 - `tracing_enabled(boolean)`
 - `log_level(string)`
 
+`basilisk.log`
+
+Logs directly from Lua through the gateway's `tracing` subscriber (target `basilisk::lua`). All five tracing output
+levels are exposed with identical semantics:
+
+- `trace(formatString, ...)`
+- `debug(formatString, ...)`
+- `info(formatString, ...)`
+- `warn(formatString, ...)`
+- `error(formatString, ...)`
+
+The first argument is a format string using Rust formatting syntax:
+
+- `{}` substitutes the next positional argument
+- `{0}`, `{1}`, ... substitute an argument by index
+- `{name}` substitutes a field looked up in a trailing Lua table argument (when the last argument is a table, it is the
+  named-lookup source and is not consumed by positional placeholders)
+- `{{` and `}}` escape literal braces
+- format specifications (for example `{value:>10}`) are not supported; format values in Lua before logging
+
+```lua
+basilisk.log.info("instance {} booted", "orders-1")
+basilisk.log.warn("memory {threshold} MB used", { threshold = 90 })
+```
+
+Each argument is rendered with `tostring` semantics (`nil`, numbers, booleans, strings; other values fall back to the
+Lua `tostring`). Logging never raises Lua errors: placeholder/argument mismatches emit a `log formatting failed: ...`
+event (with the original format string) at the requested level instead of failing the calling middleware, resolver, or
+bus handler.
+
 `basilisk.registry`
 
-- `bind_path(pathPrefix, serviceId)`
+- `bind_path(pathPrefix, serviceId | resolverFn)` - binds a prefix to a fixed service, or to a resolver function that
+  names the target service per request (see 6.11)
 - `resolve_path(path)` -> `serviceId | nil`
 - `has_service(serviceId)` -> `boolean`
 
@@ -565,6 +613,38 @@ Route health is evaluated from upstream TCP reachability:
 
 When `port = 0`, Basilisk treats the upstream as host-only and uses the default port for reachability checks (`80` for HTTP, `443` for HTTPS).
 
+### 6.11 Dynamic resolver routing with `registry.bind_path`
+
+`bind_path` accepts a resolver function instead of a fixed service id. When a request path matches the bound prefix,
+Basilisk invokes the resolver before the registry fallback resolution. The handler receives the same `req` context
+dictionary as proxy middleware plus a `resolve` callback:
+
+```lua
+basilisk.registry.bind_path("/dyn", function(req, resolve)
+    -- resolve expects the *service id* (not the upstream URL);
+    -- the request is then routed to an instance of that service
+    -- registered via /registry/register
+    if string.find(req.path, "/reporting", 1, true) then
+        resolve("reporting")
+        return
+    end
+    resolve("orders")
+end)
+```
+
+Semantics:
+
+- Matching mounts run in definition order; a mount only claims the request when its resolver calls `resolve(serviceName)`.
+- If the resolver does not call `resolve`, resolution falls through to the next matching mount and finally to registry
+  path-prefix resolution (so registry-registered services still handle the path).
+- The resolved service must be registered in the registry; otherwise the request is rejected with `404` and an error
+  message naming the unresolved service.
+- When a resolver names a service, the bound `pathPrefix` is stripped (when `strip_prefix(true)`) the same way registry
+  prefixes are.
+- If the named service is not registered (or not marked `Up`), the request fails with `404`.
+- Use this when a single prefix (`/api`) maps to services determined by request details (tenants, headers, path
+  segments) instead of static `pathPrefixes`.
+
 ## 7. HTTP Registry API
 
 Base URL: `http://<host>:<port>`.
@@ -596,9 +676,36 @@ Example request:
 }
 ```
 
+Key-pair example (when `basilisk.security.service_registration_auth('KEY_PAIR')` is configured):
+
+```json
+{
+  "serviceId": "orders",
+  "fingerprint": "orders-v1",
+  "pathPrefixes": [
+    "/api/orders"
+  ],
+  "instance": {
+    "instanceId": "",
+    "scheme": "http",
+    "host": "127.0.0.1",
+    "port": 7001,
+    "weight": 1
+  },
+  "auth": {
+    "type": "key_pair",
+    "signature": "base64url-ed25519-signature-over-serviceId-bytes"
+  }
+}
+```
+
 Notes:
 
 - If `service_registration_auth == "TOKEN"`, `auth.type` must be `token` and token must match `registration_token`.
+- If `service_registration_auth == "KEY_PAIR"`, `auth.type` must be `key_pair` and `auth.signature` must be an Ed25519
+  signature (base64, URL-safe, no padding) over the exact `serviceId` bytes, verifiable with the public key provisioned
+  via `basilisk.security.registration_public_key`. Registering an unknown service or an invalid signature returns
+  `401 AUTH_FAILED`.
 - Path prefix ownership is exclusive across services.
 - If `instance.instanceId` is empty, Basilisk generates a cryptographically secure instance ID and returns it in the
   registration response.
@@ -726,9 +833,12 @@ Forward response:
 3. Non-registry routes enter `ProxyHandler` fallback.
 4. Lua middleware chain executes in registration order.
 5. If middleware ends response, the request is short-circuited.
-6. Otherwise, service is resolved by the longest matching path prefix.
+6. Route target is resolved: static `proxy.forward` mounts first, then dynamic `registry.bind_path` resolver mounts,
+   then the longest matching registry path prefix.
 7. Healthy instance selected by configured load-balancing strategy.
 8. Request is forwarded to the selected instance.
+9. When the upstream opts in via `x-basilisk-cache`, the response may be served from (and stored into) the response
+   cache; proxied responses expose `x-basilisk-cache-status: hit` or `miss`.
 
 ### 9.2 Registry maintenance flow
 
@@ -738,6 +848,18 @@ Background task:
 - marks stale heartbeats as `Down` and irregular cadence as `Degraded`
 - removes stale down instances beyond timeout
 - when `connection_health_enabled(false)` (default), proxy reachability also drives health: consecutive unreachable upstream connections increment a per-instance counter and mark `Down` after `proxy_failure_threshold` attempts; successful proxy resets the counter
+
+### 9.3 Response caching flow
+
+When `basilisk.cache.enabled(true)` and the upstream answers with a valid `x-basilisk-cache` directive:
+
+1. Cache lookup by `method + path + query` happens before upstream forwarding.
+2. On a miss, the request is forwarded upstream; eligible responses (`< 400`, body ≤ 2 MiB) are stored with the
+   directive's TTL.
+3. On a hit, the stored response is replayed directly without touching the registry or upstream.
+4. Entries are evicted by the directive's policy (`LRU`, `LFU`, `FIFO`, `LIFO`, `MRU`, `ARC`, `RANDOM`) and bounded by
+   `basilisk.cache.max_response_entries` (default `1024`).
+5. `x-basilisk-cache: disabled` marks the response uncachable; it is forwarded as-is without adding a status header.
 
 ## 10. Common Use Cases
 
@@ -765,6 +887,13 @@ Background task:
 - Internal keys are namespaced with `basilisk:gateway:<key_prefix>:...` and hidden from user-facing
   `basilisk.cache.keys()`.
 - User keys (for middleware/runtime use) remain unprefixed and do not collide with proxy internals.
+
+### 10.5 Key-pair registration without a shared secret
+
+- Each service holds its own Ed25519 private key; only the public key is provisioned into gateway config via
+  `basilisk.security.registration_public_key(serviceId, publicKey)`.
+- At registration, the service signs its `serviceId` and sends it in `auth.signature` with `auth.type = "key_pair"`.
+- Gateway verifies the signature against the per-service public key, so no shared registration token is distributed.
 
 ## 11. Testing
 
@@ -854,7 +983,7 @@ to gate on p95 latency regression relative to the baseline (Basilisk direct).
 The results below were recorded on the development machine described in the table. All three traffic paths (Basilisk
 direct, NGINX front, HAProxy front) run within Docker Compose on the same host.
 
-**Test machine**
+#### Test machine
 
 | Property        | Value                                                                      |
 |-----------------|----------------------------------------------------------------------------|
@@ -864,7 +993,7 @@ direct, NGINX front, HAProxy front) run within Docker Compose on the same host.
 | RAM             | 16 GiB                                                                     |
 | Primary storage | Intel Optane NVMe SSD 476.9 GB                                             |
 
-**Throughput (GET `/bench/ping`)**
+#### Throughput (GET `/bench/ping`)
 
 | Traffic path            | Req/s   | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
 |-------------------------|---------|-----------|--------------|----------|----------|----------|
@@ -873,10 +1002,11 @@ direct, NGINX front, HAProxy front) run within Docker Compose on the same host.
 | nginx-front-summary     | 904.46  | 18119     | 100.00       | 27.41    | 7.61     | 131.35   |
 
 Baseline target: `basilisk-direct-summary`
+
 - `haproxy-front-summary` p95 delta vs. baseline: +104.55%
 - `nginx-front-summary` p95 delta vs. baseline: +2307.99%
 
-**Round-trip (mixed GET ping / POST echo, 8 KB payload, 70 % POST)**
+#### Round-trip (mixed GET ping / POST echo, 8 KB payload, 70 % POST)
 
 | Traffic path    | Req/s   | Total req | Check pass % | Avg (ms) | p50 (ms) | p95 (ms) |
 |-----------------|---------|-----------|--------------|----------|----------|----------|
@@ -885,11 +1015,12 @@ Baseline target: `basilisk-direct-summary`
 | nginx-front     | 929.71  | 18622     | 100.00       | 26.51    | 9.99     | 83.97    |
 
 Baseline target: `basilisk-direct`
+
 - `haproxy-front` p95 delta vs. baseline: +151.29%
 - `nginx-front` p95 delta vs. baseline: +942.89%
 
-
 ## 12. Operational Notes
+
 - Registry and service buses are in-memory; state is not persisted across restarts.
 - Cache is shared between Lua primitives and gateway internals through `AppState.cache`.
 - Redis and Memcached providers degrade to unavailable/no-op behavior when their backend cannot be reached.
@@ -935,10 +1066,22 @@ Check that:
 
 - Verify service is registered and owns a matching path prefix.
 - Verify the route prefix and request path alignment.
+- For `registry.bind_path` resolver mounts: the resolver named a service that is not registered, or the resolver did not
+  call `resolve` and no registry prefix owns the path. Gateway-generated failures include the cause in the response body
+  (`text/plain`), for example `dynamically resolved service '<id>' is not registered`.
+
+### Proxy returns `500`
+
+- When dynamic resolver mounts (`registry.bind_path` with a handler) are in use, a `500` with a `text/plain` body means
+  the resolver raised a Lua error or misused `resolve`; the response body contains the mount id and the Lua error with
+  its traceback.
+- Upstream-generated `500` responses are forwarded unchanged (no added body).
 
 ### Proxy returns `503`
 
 - Verify at least one instance is `Up` with recent, stable metrics heartbeat.
+- Gateway-generated `503` responses (for example, no healthy instance for the resolved service) include the cause in the
+  response body.
 
 ### HTTP 431 (Request Header Fields Too Large)
 
@@ -958,6 +1101,7 @@ This error occurs when request headers exceed the HTTP server's size limit (hype
     - Avoid repeating headers
 
 2. **Filter headers in Lua middleware:**
+
    ```lua
    basilisk.proxy.use(function(req, res, next)
      -- Remove overly large header values before proxying
@@ -975,9 +1119,11 @@ This error occurs when request headers exceed the HTTP server's size limit (hype
 3. **Deploy behind a front-end reverse proxy (nginx, HAProxy):**
     - Configure a front proxy to buffer/normalize headers
     - Example nginx config:
-      ```
+
+      ```conf
       large_client_header_buffers 4 32k;
       ```
+
     - This allows the front proxy to handle decompression and header aggregation while Basilisk processes normalized
       requests
 

@@ -19,7 +19,12 @@ mod base;
 mod in_memory;
 mod memcached;
 mod redis;
+pub mod response_cache;
 mod runtime;
 
 pub use base::CacheProvider;
+pub use response_cache::{
+    CACHE_CONTROL_HEADER, CACHE_STATUS_HEADER, CacheControlDirective, CachedResponse,
+    EvictionPolicy, ResponseCache, parse_cache_control_directive,
+};
 pub use runtime::GatewayCache;

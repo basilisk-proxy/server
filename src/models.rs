@@ -81,10 +81,26 @@ pub struct InstanceInfo {
 }
 
 /// Registration authentication information.
+///
+/// `token` carries the shared registration token for `TOKEN` auth and stays
+/// empty for key-pair auth. `signature` carries an Ed25519 signature over the
+/// service id, base64-encoded (URL-safe, no padding), for `KEY_PAIR` auth.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthInfo {
     pub r#type: String,
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// Supported registration authentication modes.
+pub mod auth_modes {
+    /// Shared-token registration authentication (default).
+    pub const TOKEN: &str = "TOKEN";
+    /// Key-pair registration authentication: the service signs its own service id
+    /// and the gateway verifies it against the Lua-configured public key.
+    pub const KEY_PAIR: &str = "KEY_PAIR";
 }
 
 /// Standard API error envelope.
@@ -106,4 +122,6 @@ pub mod error_codes {
     pub const INVALID_CONFIG: &str = "INVALID_CONFIG";
     pub const FINGERPRINT_INVALID: &str = "FINGERPRINT_INVALID";
     pub const REGISTRATION_IP_NOT_ALLOWED: &str = "REGISTRATION_IP_NOT_ALLOWED";
+    /// A key-pair registration failed verification.
+    pub const SIGNATURE_INVALID: &str = "SIGNATURE_INVALID";
 }

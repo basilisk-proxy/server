@@ -2,7 +2,7 @@ pub mod header_limiter;
 pub mod proxy;
 pub mod routes;
 
-use crate::cache::GatewayCache;
+use crate::cache::{GatewayCache, ResponseCache};
 use crate::config::GatewayConfig;
 use crate::gateway::proxy::{ProxyHandler, UpstreamHttpClient};
 use crate::lua_config::LuaRuntime;
@@ -28,6 +28,8 @@ pub struct AppState {
     pub lua_runtime: Arc<LuaRuntime>,
     /// Shared gateway cache used by Lua primitives and proxy internals.
     pub cache: Arc<GatewayCache>,
+    /// Proxied-response cache layered on top of the shared gateway cache.
+    pub response_cache: Arc<ResponseCache>,
     /// Shared upstream HTTP client used by reverse-proxy forwarding.
     pub upstream_client: UpstreamHttpClient,
     /// Aggregated runtime telemetry (latencies + monitored service distributions).

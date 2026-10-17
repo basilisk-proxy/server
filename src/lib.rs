@@ -1,6 +1,7 @@
 /// Cache strategy abstractions and backend implementations.
 pub mod cache;
 pub mod config;
+pub mod crypto;
 pub mod dto;
 pub mod gateway;
 mod helper;

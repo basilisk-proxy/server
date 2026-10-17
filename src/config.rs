@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level runtime configuration consumed by the gateway, registry and service bus.
@@ -44,6 +46,13 @@ pub struct CacheOptions {
     pub service_resolution_ttl_seconds: u64,
     pub ttl_seconds: u64,
     pub strategy: String,
+    /// Maximum number of proxied responses retained by the response cache.
+    #[serde(default = "default_response_cache_max_entries")]
+    pub response_cache_max_entries: usize,
+}
+
+fn default_response_cache_max_entries() -> usize {
+    1024
 }
 
 /// Service-registry maintenance timing options.
@@ -57,6 +66,10 @@ pub struct RegistryOptions {
 pub struct SecurityOptions {
     pub service_registration_auth: String,
     pub registration_token: String,
+    /// Known per-service Ed25519 public keys used for key-pair registration
+    /// authentication. Keys are base64-encoded (URL-safe, no padding).
+    #[serde(default)]
+    pub registration_public_keys: HashMap<String, String>,
 }
 
 /// Logging and telemetry behavior.
@@ -112,6 +125,7 @@ impl Default for GatewayConfig {
                 service_resolution_ttl_seconds: 300,
                 ttl_seconds: 300,
                 strategy: "lru".to_string(),
+                response_cache_max_entries: default_response_cache_max_entries(),
             },
             registry: RegistryOptions {
                 heartbeat_timeout_seconds: 30,
@@ -119,6 +133,7 @@ impl Default for GatewayConfig {
             security: SecurityOptions {
                 service_registration_auth: "TOKEN".to_string(),
                 registration_token: "secret-token".to_string(),
+                registration_public_keys: HashMap::new(),
             },
             observability: ObservabilityOptions {
                 metrics_enabled: true,

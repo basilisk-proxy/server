@@ -15,12 +15,14 @@ use basilisk::models::{AuthInfo, InstanceInfo, RegistrationRequest};
 use basilisk::observability::RuntimeTelemetry;
 use basilisk::registry::ServiceRegistry;
 use basilisk::service_bus::connection_manager::ConnectionManager;
+use ed25519_dalek::Signer as _;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
 fn test_state() -> Arc<AppState> {
+    let cache = Arc::new(GatewayCache::new("memory").expect("cache init"));
     Arc::new(AppState {
         config: GatewayConfig::default(),
         gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
@@ -28,7 +30,11 @@ fn test_state() -> Arc<AppState> {
         connection_manager: Arc::new(ConnectionManager::new()),
         proxy_handler: ProxyHandler::new(),
         lua_runtime: LuaRuntime::allow_all(),
-        cache: Arc::new(GatewayCache::new("memory").expect("cache init")),
+        cache: Arc::clone(&cache),
+        response_cache: Arc::new(basilisk::cache::ResponseCache::new(
+            Arc::clone(&cache),
+            1024,
+        )),
         upstream_client: new_upstream_http_client(),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     })
@@ -49,6 +55,7 @@ fn registration_request(service_id: &str, instance_id: &str) -> RegistrationRequ
         auth: AuthInfo {
             r#type: "token".to_string(),
             token: "secret-token".to_string(),
+            signature: None,
         },
     }
 }
@@ -167,7 +174,11 @@ async fn register_route_respects_registration_allowlist() {
         connection_manager,
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
-        cache,
+        cache: Arc::clone(&cache),
+        response_cache: Arc::new(basilisk::cache::ResponseCache::new(
+            Arc::clone(&cache),
+            1024,
+        )),
         upstream_client: new_upstream_http_client(),
         telemetry: Arc::new(RuntimeTelemetry::new()),
     });
@@ -189,6 +200,133 @@ async fn register_route_respects_registration_allowlist() {
     .await
     .into_response();
     assert_eq!(allowed_response.status(), StatusCode::OK);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn key_pair_request(
+    service_id: &str,
+    instance_id: &str,
+    signature_b64: &str,
+) -> RegistrationRequest {
+    RegistrationRequest {
+        auth: AuthInfo {
+            r#type: "key_pair".to_string(),
+            token: String::new(),
+            signature: Some(signature_b64.to_string()),
+        },
+        ..registration_request(service_id, instance_id)
+    }
+}
+
+fn base64url_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[tokio::test]
+async fn register_route_verifies_key_pair_signatures_from_lua_provisioned_keys() {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let public_key = base64url_encode(signing_key.verifying_key().to_bytes().as_slice());
+
+    let dir = test_dir("registration_key_pair");
+    let script = dir.join("basilisk.lua");
+    fs::write(
+        &script,
+        format!(
+            "basilisk.security.service_registration_auth('KEY_PAIR')\n\
+             basilisk.security.registration_public_key('orders', '{public_key}')\n"
+        ),
+    )
+    .expect("failed to write script");
+
+    let registry = Arc::new(ServiceRegistry::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
+    let (config, lua_runtime, cache) = load_config_and_runtime(
+        &script.to_string_lossy(),
+        Arc::clone(&registry),
+        Arc::clone(&connection_manager),
+    )
+    .expect("failed to load lua runtime");
+    assert_eq!(
+        config.security.service_registration_auth,
+        basilisk::models::auth_modes::KEY_PAIR
+    );
+    assert!(
+        config
+            .security
+            .registration_public_keys
+            .contains_key("orders")
+    );
+
+    let state = Arc::new(AppState {
+        config,
+        gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+        registry,
+        connection_manager,
+        proxy_handler: ProxyHandler::new(),
+        lua_runtime,
+        cache: Arc::clone(&cache),
+        response_cache: Arc::new(basilisk::cache::ResponseCache::new(
+            Arc::clone(&cache),
+            1024,
+        )),
+        upstream_client: new_upstream_http_client(),
+        telemetry: Arc::new(RuntimeTelemetry::new()),
+    });
+
+    let socket_addr = SocketAddr::from(([127, 0, 0, 1], 9100));
+    let signature = base64url_encode(signing_key.sign("orders".as_bytes()).to_bytes().as_slice());
+
+    // Valid signature over the service id registers successfully.
+    let ok_response = routes::register(
+        State(Arc::clone(&state)),
+        ConnectInfo(socket_addr),
+        Json(key_pair_request("orders", "orders-1", &signature)),
+    )
+    .await
+    .into_response();
+    assert_eq!(ok_response.status(), StatusCode::OK);
+
+    // A signature produced by a different key fails verification.
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+    let wrong_signature =
+        base64url_encode(other_key.sign("orders".as_bytes()).to_bytes().as_slice());
+    let bad_response = routes::register(
+        State(Arc::clone(&state)),
+        ConnectInfo(socket_addr),
+        Json(key_pair_request("orders", "orders-2", &wrong_signature)),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
+
+    // Services without a provisioned public key are rejected.
+    let unknown_service = routes::register(
+        State(Arc::clone(&state)),
+        ConnectInfo(socket_addr),
+        Json(key_pair_request("ghost", "ghost-1", &signature)),
+    )
+    .await
+    .into_response();
+    assert_eq!(unknown_service.status(), StatusCode::UNAUTHORIZED);
+
+    // Requests missing the signature entirely are rejected.
+    let unsigned = routes::register(
+        State(Arc::clone(&state)),
+        ConnectInfo(socket_addr),
+        Json(RegistrationRequest {
+            auth: AuthInfo {
+                r#type: "key_pair".to_string(),
+                token: String::new(),
+                signature: None,
+            },
+            ..registration_request("orders", "orders-3")
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
 
     let _ = fs::remove_dir_all(dir);
 }

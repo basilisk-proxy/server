@@ -1,6 +1,8 @@
+use crate::crypto::verify_service_key_pair;
 use crate::dto::ServiceData;
 use crate::gateway::AppState;
 use crate::lua_config::RequestConnectionInfo;
+use crate::models::auth_modes;
 use crate::models::{ErrorDetail, ErrorResponse, RegistrationRequest, error_codes};
 use axum::extract::ConnectInfo;
 use axum::{
@@ -65,16 +67,42 @@ pub async fn register(
     }
 
     // 1. Authenticate Registration (FR-1)
-    if state.config.security.service_registration_auth == "TOKEN" && request.auth.r#type != "token"
-        || request.auth.token != state.config.security.registration_token
+    let auth_failure = if state
+        .config
+        .security
+        .service_registration_auth
+        .eq_ignore_ascii_case(auth_modes::KEY_PAIR)
     {
-        warn!("Authentication failed for service {}", request.service_id);
+        verify_key_pair_registration(&state, &request)
+            .err()
+            .map(|message| {
+                warn!(
+                    service_id = %request.service_id,
+                    reason = %message,
+                    "key-pair authentication failed for service registration"
+                );
+                message
+            })
+    } else {
+        // Preserve the legacy shared-token semantics exactly.
+        if state.config.security.service_registration_auth == auth_modes::TOKEN
+            && request.auth.r#type != "token"
+            || request.auth.token != state.config.security.registration_token
+        {
+            warn!("Authentication failed for service {}", request.service_id);
+            Some("Authentication failed for service registration".to_string())
+        } else {
+            None
+        }
+    };
+
+    if let Some(message) = auth_failure {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
                 error: ErrorDetail {
                     code: error_codes::AUTH_FAILED.to_string(),
-                    message: "Authentication failed for service registration".to_string(),
+                    message,
                 },
             }),
         )
@@ -204,4 +232,40 @@ pub async fn get_service(
 /// Returns runtime telemetry aggregated by the proxy server.
 pub async fn get_runtime_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.telemetry.snapshot())
+}
+
+/// Validates a `KEY_PAIR` registration against the provisioned public keys.
+///
+/// The service signs its own service id (the registration challenge) with its
+/// private key; the gateway verifies the signature with the Ed25519 public key
+/// provisioned for that service via the Lua init script.
+fn verify_key_pair_registration(
+    state: &AppState,
+    request: &RegistrationRequest,
+) -> Result<(), String> {
+    if !request.auth.r#type.eq_ignore_ascii_case("key_pair") {
+        return Err(
+            "key-pair registration authentication requires auth type 'key_pair'".to_string(),
+        );
+    }
+    let Some(signature) = request.auth.signature.as_deref().map(str::trim) else {
+        return Err(
+            "key-pair registration authentication requires a signature over the service id"
+                .to_string(),
+        );
+    };
+    if signature.is_empty() {
+        return Err(
+            "key-pair registration authentication requires a signature over the service id"
+                .to_string(),
+        );
+    }
+    match verify_service_key_pair(
+        &request.service_id,
+        signature,
+        &state.config.security.registration_public_keys,
+    ) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
 }

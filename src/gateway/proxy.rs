@@ -1,3 +1,7 @@
+use crate::cache::{
+    CACHE_CONTROL_HEADER, CACHE_STATUS_HEADER, CachedResponse, ResponseCache,
+    parse_cache_control_directive,
+};
 use crate::gateway::AppState;
 use crate::lua_config::AfterMiddlewareContext;
 use crate::lua_config::MiddlewareResponse;
@@ -38,6 +42,8 @@ const ROUTE_CACHE_MISS_SENTINEL: &str = "__basilisk:miss__";
 const PROXY_HOP_COUNT_HEADER: &str = "x-basilisk-proxy-hop";
 const MAX_PROXY_HOPS: u8 = 3;
 const MAX_PROXY_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
+/// Response bodies larger than this are streamed through and never cached.
+const MAX_PROXY_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 pub type UpstreamHttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 type ForwardOutcome = (Response<Body>, Option<String>, f64, f64);
@@ -93,6 +99,11 @@ impl ProxyHandler {
         let path = req.uri().path().to_string();
         let method = req.method().as_str().to_string();
         let req_headers = req.headers().clone();
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| path.clone());
         let ip_address = connect_info.ip().to_canonical();
         let remote_ip = ip_address.to_string();
         let remote_port = connect_info.port();
@@ -129,8 +140,17 @@ impl ProxyHandler {
                     None,
                     HashMap::new(),
                 )
+            } else if state.config.cache.enabled
+                && let Some(cached) = Self::lookup_cached_response(&state, &method, &path_and_query)
+            {
+                let mut metrics = HashMap::new();
+                metrics.insert("proxy.response_cache_hit".to_string(), 1.0);
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.total", total_started.elapsed());
+                (cached, None, metrics)
             } else {
-                Self::proxy_to_upstream(
+                let (response, error_message, metrics) = Self::proxy_to_upstream(
                     Arc::clone(&state),
                     &path,
                     &remote_ip,
@@ -139,7 +159,17 @@ impl ProxyHandler {
                     middleware_result.forward_headers,
                     req,
                 )
-                .await
+                .await;
+
+                // Response caching: when the downstream service opted the
+                // response into the cache via X-Basilisk-Cache, buffer and
+                // store it for future equivalent requests.
+                let response = if state.config.cache.enabled && error_message.is_none() {
+                    Self::maybe_store_response(&state, &method, &path_and_query, response).await
+                } else {
+                    response
+                };
+                (response, error_message, metrics)
             };
 
         metrics.insert(
@@ -204,6 +234,122 @@ impl ProxyHandler {
         Ok((service_id, service))
     }
 
+    /// Serves a previously cached response when the response cache holds one
+    /// for the current method+path (+query). Marks it with the cache-status
+    /// `hit` header.
+    fn lookup_cached_response(
+        state: &AppState,
+        method: &str,
+        path_and_query: &str,
+    ) -> Option<Response<Body>> {
+        let cache_key = ResponseCache::response_cache_key(method, path_and_query);
+        let cached = state.response_cache.get(&cache_key).ok().flatten()?;
+        let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+        let mut builder = Response::builder().status(status);
+        for (name, value) in &cached.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder = builder.header(CACHE_STATUS_HEADER, "hit");
+        builder
+            .body(Body::from(cached.body_bytes()))
+            .ok()
+            .or_else(|| {
+                tracing::warn!("failed to reconstruct cached response for {path_and_query}");
+                None
+            })
+    }
+
+    /// Buffers and stores an upstream response when it opted into the
+    /// response cache with the `X-Basilisk-Cache` header. The response is
+    /// returned with the `x-basilisk-cache-status: miss` marker when stored;
+    /// responses above the body-size limit are streamed through uncached.
+    async fn maybe_store_response(
+        state: &AppState,
+        method: &str,
+        path_and_query: &str,
+        response: Response<Body>,
+    ) -> Response<Body> {
+        let directive_raw = response
+            .headers()
+            .get(CACHE_CONTROL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let directive = match directive_raw.map(parse_cache_control_directive) {
+            Some(Ok(Some(directive))) => directive,
+            Some(Ok(None)) => return response,
+            Some(Err(err)) => {
+                tracing::warn!(
+                    path = %path_and_query,
+                    "ignoring invalid {CACHE_CONTROL_HEADER} header: {err}"
+                );
+                return response;
+            }
+            None => return response,
+        };
+
+        if response.status() >= StatusCode::BAD_REQUEST {
+            tracing::debug!(path = %path_and_query, "error responses are not cached");
+            return response;
+        }
+
+        if let Some(length) = header_to_u64(response.headers().get(CONTENT_LENGTH))
+            && length as usize > MAX_PROXY_RESPONSE_BODY_BYTES
+        {
+            tracing::debug!(
+                path = %path_and_query,
+                body_size = length,
+                "response body exceeds response cache limit; streaming uncached"
+            );
+            return response;
+        }
+
+        let cache_key = ResponseCache::response_cache_key(method, path_and_query);
+        let (parts, body) = response.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, MAX_PROXY_RESPONSE_BODY_BYTES).await else {
+            tracing::warn!(
+                path = %path_and_query,
+                "response body could not be buffered for the response cache"
+            );
+            return (StatusCode::BAD_GATEWAY, "response body too large to cache").into_response();
+        };
+
+        let headers: HashMap<String, String> = parts
+            .headers
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str() != CACHE_CONTROL_HEADER
+                    && name != &CONTENT_LENGTH
+                    && !is_hop_by_hop_header(name.as_str())
+            })
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+
+        let cached = CachedResponse::new(parts.status.as_u16(), headers.clone(), bytes.to_vec());
+        if let Err(err) =
+            state
+                .response_cache
+                .put(&cache_key, &cached, directive.ttl_seconds, directive.policy)
+        {
+            tracing::warn!(path = %path_and_query, "failed to cache response: {err}");
+        }
+
+        let mut builder = Response::builder()
+            .status(parts.status)
+            .header(CACHE_STATUS_HEADER, "miss");
+        for (name, value) in headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| Response::new(Body::from("Bad Gateway")))
+    }
+
     async fn proxy_to_upstream(
         state: Arc<AppState>,
         path: &str,
@@ -234,7 +380,10 @@ impl ProxyHandler {
 
                 if resolution.reachable_targets.is_empty() {
                     return (
-                        StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        Self::plain_error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "No reachable static upstreams available",
+                        ),
                         Some("No reachable static upstreams available".to_string()),
                         metrics,
                     );
@@ -295,17 +444,86 @@ impl ProxyHandler {
                     duration_to_ms(static_forward_elapsed),
                 );
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    Self::plain_error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
                     Some(err.to_string()),
                     metrics,
                 );
             }
         }
 
+        // Dynamic resolver mounts (basilisk.registry.bind_path with a handler)
+        // are consulted next; matches may route the request to any registered
+        // service by name.
+        let dynamic_started = Instant::now();
+        let dynamic_resolution = match state.lua_runtime.resolve_dynamic_forward(
+            path,
+            req.method().as_str(),
+            req.headers(),
+            &connection_info,
+        ) {
+            Ok(resolution) => resolution,
+            Err(err) => {
+                let dynamic_elapsed = dynamic_started.elapsed();
+                state
+                    .telemetry
+                    .record_proxy_latency("proxy.resolve_dynamic_forward", dynamic_elapsed);
+                metrics.insert(
+                    "proxy.resolve_dynamic_forward_ms".to_string(),
+                    duration_to_ms(dynamic_elapsed),
+                );
+                return (
+                    Self::plain_error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+                    Some(err.to_string()),
+                    metrics,
+                );
+            }
+        };
+        let dynamic_elapsed = dynamic_started.elapsed();
+        state
+            .telemetry
+            .record_proxy_latency("proxy.resolve_dynamic_forward", dynamic_elapsed);
+        metrics.insert(
+            "proxy.resolve_dynamic_forward_ms".to_string(),
+            duration_to_ms(dynamic_elapsed),
+        );
+
         let resolve_started = Instant::now();
-        let (service_id, service) = match Self::resolve_service(&state, path) {
-            Ok(res) => res,
-            Err(status) => {
+        let resolve_result: Result<
+            (String, ServiceDefinition, Option<String>),
+            (StatusCode, String),
+        > = if let Some(resolution) = dynamic_resolution {
+            state
+                .registry
+                .get_service(&resolution.service_id)
+                .map(|service| {
+                    (
+                        resolution.service_id.clone(),
+                        service,
+                        Some(resolution.matched_prefix),
+                    )
+                })
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "dynamically resolved service '{}' is not registered",
+                            resolution.service_id
+                        ),
+                    )
+                })
+        } else {
+            Self::resolve_service(&state, path)
+                .map(|(service_id, service)| (service_id, service, None))
+                .map_err(|status| {
+                    (
+                        status,
+                        format!("route resolution failed with status {}", status),
+                    )
+                })
+        };
+        let (service_id, service, dynamic_prefix) = match resolve_result {
+            Ok(result) => result,
+            Err((status, message)) => {
                 let resolve_elapsed = resolve_started.elapsed();
                 state
                     .telemetry
@@ -315,8 +533,8 @@ impl ProxyHandler {
                     duration_to_ms(resolve_elapsed),
                 );
                 return (
-                    status.into_response(),
-                    Some(format!("route resolution failed with status {}", status)),
+                    Self::plain_error_response(status, &message),
+                    Some(message),
                     metrics,
                 );
             }
@@ -347,7 +565,7 @@ impl ProxyHandler {
                         duration_to_ms(pick_elapsed),
                     );
                     return (
-                        (status, msg).into_response(),
+                        Self::plain_error_response(status, msg),
                         Some(msg.to_string()),
                         metrics,
                     );
@@ -367,8 +585,13 @@ impl ProxyHandler {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(path);
-        let target_uri =
-            Self::prepare_target_uri(&state, &service, request_path_and_query, target_instance);
+        let target_uri = Self::prepare_target_uri(
+            &state,
+            &service,
+            request_path_and_query,
+            target_instance,
+            dynamic_prefix.as_deref(),
+        );
 
         // Self-routing guard: reject immediately if the resolved target points back at
         // this gateway instance. This prevents tight routing loops without burning hop
@@ -437,6 +660,25 @@ impl ProxyHandler {
         builder
             .body(Body::from(middleware_response.body))
             .unwrap_or_else(|_| Response::new(Body::from("Internal Server Error")))
+    }
+
+    /// Builds a gateway-generated failure response whose body carries the
+    /// diagnostic message, so clients can see why dynamic resolution, static
+    /// forwarding, or route resolution rejected the request.
+    fn plain_error_response(status: StatusCode, message: &str) -> Response<Body> {
+        Response::builder()
+            .status(status)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )
+            .body(Body::from(message.to_string()))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(status)
+                    .body(Body::from("Internal Server Error"))
+                    .expect("static error response must build")
+            })
     }
 
     fn resolve_service_id(state: &AppState, path: &str) -> Option<String> {
@@ -548,16 +790,26 @@ impl ProxyHandler {
         service: &ServiceDefinition,
         path_and_query: &str,
         instance: &ServiceInstance,
+        dynamic_prefix: Option<&str>,
     ) -> String {
         let (path, query) = path_and_query
             .split_once('?')
             .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
 
         let mut final_path = path;
-        if state.config.routing.strip_prefix
-            && let Some(prefix) = service.path_prefixes.iter().find(|p| path.starts_with(*p))
-        {
-            final_path = &path[prefix.len()..];
+        if state.config.routing.strip_prefix {
+            let strip_prefix = dynamic_prefix
+                .filter(|prefix| path.starts_with(*prefix))
+                .or_else(|| {
+                    service
+                        .path_prefixes
+                        .iter()
+                        .map(String::as_str)
+                        .find(|owned| path.starts_with(owned))
+                });
+            if let Some(prefix) = strip_prefix {
+                final_path = &path[prefix.len()..];
+            }
         }
         let stripped = final_path.strip_prefix('/').unwrap_or(final_path);
         let base_uri = instance.to_uri();
@@ -1071,6 +1323,7 @@ mod tests {
         let config = GatewayConfig::default();
         let connection_manager = Arc::new(ConnectionManager::new());
         let proxy_handler = ProxyHandler::new();
+        let cache = Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init"));
         Arc::new(AppState {
             config,
             gateway_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
@@ -1078,7 +1331,8 @@ mod tests {
             connection_manager,
             proxy_handler,
             lua_runtime: LuaRuntime::allow_all(),
-            cache: Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init")),
+            cache: Arc::clone(&cache),
+            response_cache: Arc::new(crate::cache::ResponseCache::new(Arc::clone(&cache), 1024)),
             upstream_client: new_upstream_http_client(),
             telemetry: Arc::new(RuntimeTelemetry::new()),
         })
@@ -1117,6 +1371,10 @@ mod tests {
             proxy_handler: ProxyHandler::new(),
             lua_runtime: LuaRuntime::allow_all(),
             cache: Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init")),
+            response_cache: Arc::new(crate::cache::ResponseCache::new(
+                Arc::new(crate::cache::GatewayCache::new("memory").expect("cache init")),
+                1024,
+            )),
             upstream_client: new_upstream_http_client(),
             telemetry: Arc::new(RuntimeTelemetry::new()),
         });
@@ -1138,6 +1396,7 @@ mod tests {
                 auth: crate::models::AuthInfo {
                     r#type: "none".to_string(),
                     token: "token".to_string(),
+                    signature: None,
                 },
             })
             .await;
@@ -1209,7 +1468,8 @@ mod tests {
             last_heartbeat_utc: chrono::Utc::now(),
         };
 
-        let target = ProxyHandler::prepare_target_uri(&state, &service, "/api/ping", &instance);
+        let target =
+            ProxyHandler::prepare_target_uri(&state, &service, "/api/ping", &instance, None);
 
         assert_eq!(target, "http://orders-svc/ping");
     }
@@ -1241,6 +1501,7 @@ mod tests {
             &service,
             "/api/ping?foo=bar&baz=1",
             &instance,
+            None,
         );
 
         assert_eq!(target, "http://orders-svc/ping?foo=bar&baz=1");
@@ -1266,6 +1527,7 @@ mod tests {
                 auth: crate::models::AuthInfo {
                     r#type: "none".to_string(),
                     token: "tok".to_string(),
+                    signature: None,
                 },
             })
             .await;

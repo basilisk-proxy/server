@@ -337,6 +337,7 @@ async fn authenticated_bus_connection_sets_health_up_and_disconnect_sets_down() 
             auth: AuthInfo {
                 r#type: "token".to_string(),
                 token: "token".to_string(),
+                signature: None,
             },
         })
         .await;
@@ -442,6 +443,7 @@ async fn monitoring_enabled_disconnect_does_not_force_immediate_down() {
             auth: AuthInfo {
                 r#type: "token".to_string(),
                 token: "token".to_string(),
+                signature: None,
             },
         })
         .await;

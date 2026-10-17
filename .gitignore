@@ -24,3 +24,4 @@ basilisk.lua
 benchmarks/results/*.json
 benchmarks/results/*.md
 benchmarks/.docker-config/
+**__pycache__

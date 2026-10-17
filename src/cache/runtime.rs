@@ -233,6 +233,21 @@ impl GatewayCache {
         })
     }
 
+    /// Stores a string value with a TTL using the reserved internal namespace.
+    pub fn internal_set_with_ttl(
+        &self,
+        key: &str,
+        value: String,
+        ttl_seconds: u64,
+    ) -> anyhow::Result<()> {
+        self.set_with_ttl(&self.internal_key(key), value, ttl_seconds)
+    }
+
+    /// Deletes a key under the reserved internal namespace.
+    pub fn internal_delete(&self, key: &str) -> anyhow::Result<()> {
+        self.delete(&self.internal_key(key))
+    }
+
     fn internal_key(&self, key: &str) -> String {
         let namespace = self
             .internal_namespace_prefix()

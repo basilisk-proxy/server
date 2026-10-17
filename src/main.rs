@@ -108,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Setup HTTP Gateway
     let gateway_addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
+    let response_cache = basilisk::cache::ResponseCache::new(
+        Arc::clone(&cache),
+        config.cache.response_cache_max_entries,
+    );
     let state = Arc::new(AppState {
         config: config.clone(),
         gateway_addr,
@@ -116,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         proxy_handler: ProxyHandler::new(),
         lua_runtime,
         cache,
+        response_cache: Arc::new(response_cache),
         upstream_client: new_upstream_http_client(),
         telemetry,
     });
