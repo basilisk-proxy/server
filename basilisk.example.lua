@@ -86,6 +86,72 @@ basilisk.proxy.use(function(req, _, next)
   return next()
 end)
 
+-- Example: cache-backed API key rate limiting.
+-- Uses a classic fixed-window counter per API key. Per-key limits live in the
+-- shared cache under `basilisk:ratelimit:limit:<api-key>`; requests fall back
+-- to 30 requests/second when no override is configured.
+local RATE_LIMIT_WINDOW_SECONDS = 1
+local RATE_LIMIT_DEFAULT_PER_SECOND = 30
+local RATE_LIMIT_LIMIT_KEY_PREFIX = "basilisk:ratelimit:limit:"
+local RATE_LIMIT_COUNTER_KEY_PREFIX = "basilisk:ratelimit:counter:"
+
+-- Seed example overrides. `set_if_not_exists` keeps operator-managed limits in
+-- Redis/Memcached intact across restarts.
+basilisk.cache.set_if_not_exists(RATE_LIMIT_LIMIT_KEY_PREFIX .. "orders-console", "120")
+basilisk.cache.set_if_not_exists(RATE_LIMIT_LIMIT_KEY_PREFIX .. "reporting-batch", "5")
+
+basilisk.proxy.use(path_rules.has_prefix("/api"), function(req, res, next)
+  -- Headers are normalized to lowercase by Basilisk, so "X-API-Key" is read
+  -- as "x-api-key".
+  local api_key = req.headers["x-api-key"]
+  if not api_key or api_key == "" then
+    return res:status(401)
+      :set("www-authenticate", "ApiKey")
+      :send("missing X-API-Key header")
+  end
+
+  local limit = tonumber(basilisk.cache.get(RATE_LIMIT_LIMIT_KEY_PREFIX .. api_key))
+  if not limit or limit < 1 then
+    limit = RATE_LIMIT_DEFAULT_PER_SECOND
+  else
+    limit = math.floor(limit)
+  end
+
+  -- Bucket counters by window so each fixed window starts from zero.
+  local window = math.floor(os.time() / RATE_LIMIT_WINDOW_SECONDS)
+  local reset_at = (window + 1) * RATE_LIMIT_WINDOW_SECONDS
+  local counter_key = RATE_LIMIT_COUNTER_KEY_PREFIX .. api_key .. ":" .. tostring(window)
+
+  local used = basilisk.cache.incr(counter_key, 1)
+  -- Keep buckets bounded. Re-applying the TTL also covers providers whose
+  -- `incr` replaces the entry and drops its previous expiration.
+  basilisk.cache.expire(counter_key, RATE_LIMIT_WINDOW_SECONDS * 2)
+
+  local remaining = limit - used
+  if remaining < 0 then
+    remaining = 0
+  end
+
+  -- `forward_headers` exposes the quota to the downstream service for
+  -- successful requests; `set` adds the headers to the 429 response.
+  res:forward_headers("X-RateLimit-Limit", tostring(limit))
+  res:forward_headers("X-RateLimit-Remaining", tostring(remaining))
+  res:forward_headers("X-RateLimit-Reset", tostring(reset_at))
+
+  if used > limit then
+    return res:status(429)
+      :set("retry-after", tostring(RATE_LIMIT_WINDOW_SECONDS))
+      :set("x-ratelimit-limit", tostring(limit))
+      :set("x-ratelimit-remaining", "0")
+      :set("x-ratelimit-reset", tostring(reset_at))
+      :send("rate limit exceeded")
+  end
+
+  req.ctx["api_key"] = api_key
+  req.ctx["rate_limit"] = limit
+  return next()
+end)
+
 -- Example: custom middleware mounted on selected path prefix
 basilisk.proxy.use(path_rules.has_prefix("/api/private"), function(req, res, next)
   if not req.ctx["auth_token"] then
