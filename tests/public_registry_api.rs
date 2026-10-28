@@ -170,3 +170,58 @@ async fn metrics_heartbeat_irregularity_marks_instance_degraded() {
         .expect("generated instance should exist");
     assert_eq!(instance.status, InstanceStatus::Degraded);
 }
+
+#[tokio::test]
+async fn rolling_deployment_allows_overlapping_instances_and_deregisters_one_at_a_time() {
+    let registry = ServiceRegistry::new();
+    let old = registry
+        .register(registration_request("orders", vec!["/api/orders"]))
+        .await;
+    let new = registry
+        .register(registration_request("orders", vec!["/api/orders"]))
+        .await;
+    assert!(old.success);
+    assert!(new.success);
+    let old_id = old.instance_id.unwrap();
+    let new_id = new.instance_id.unwrap();
+    assert_ne!(old_id, new_id);
+
+    let service = registry.get_service("orders").unwrap();
+    assert_eq!(service.instances.len(), 2);
+    drop(service);
+
+    assert!(registry.deregister("orders", &old_id).await);
+    let service = registry.get_service("orders").unwrap();
+    assert_eq!(service.instances.len(), 1);
+    assert!(service.instances.contains_key(&new_id));
+}
+
+#[tokio::test]
+async fn deregistration_waits_for_admitted_http_and_prevents_new_dispatches() {
+    let registry = std::sync::Arc::new(ServiceRegistry::new());
+    let registered = registry
+        .register(registration_request("orders", vec!["/orders"]))
+        .await;
+    let id = registered.instance_id.unwrap();
+    let work = registry.acquire_http("orders", &id).unwrap();
+    let draining_registry = registry.clone();
+    let draining_id = id.clone();
+    let drain =
+        tokio::spawn(async move { draining_registry.deregister("orders", &draining_id).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while registry
+            .get_service("orders")
+            .unwrap()
+            .instances
+            .contains_key(&id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(registry.acquire_http("orders", &id).is_none());
+    assert!(!drain.is_finished());
+    drop(work);
+    assert!(drain.await.unwrap());
+}

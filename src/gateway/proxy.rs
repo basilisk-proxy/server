@@ -549,28 +549,37 @@ impl ProxyHandler {
         );
 
         let pick_started = Instant::now();
-        let target_instance =
-            match state
-                .proxy_handler
-                .pick_instance(&state, remote_ip, &service_id, &service)
-            {
-                Ok(inst) => inst,
-                Err((status, msg)) => {
-                    let pick_elapsed = pick_started.elapsed();
-                    state
-                        .telemetry
-                        .record_proxy_latency("proxy.pick_healthy_instance", pick_elapsed);
-                    metrics.insert(
-                        "proxy.pick_healthy_instance_ms".to_string(),
-                        duration_to_ms(pick_elapsed),
-                    );
-                    return (
-                        Self::plain_error_response(status, msg),
-                        Some(msg.to_string()),
-                        metrics,
-                    );
-                }
+        let mut selected = None;
+        // Cached resolution snapshots cannot admit work after deregistration starts.
+        for _ in 0..8 {
+            let Some(fresh) = state.registry.get_service(&service_id) else {
+                break;
             };
+            let Ok(instance) =
+                state
+                    .proxy_handler
+                    .pick_instance(&state, remote_ip, &service_id, &fresh)
+            else {
+                break;
+            };
+            if let Some(work) = state
+                .registry
+                .acquire_http(&service_id, &instance.instance_id)
+            {
+                selected = Some((instance.clone(), work));
+                break;
+            }
+        }
+        let Some((target_instance, _http_work)) = selected else {
+            return (
+                Self::plain_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No healthy instances available",
+                ),
+                Some("No healthy instances available".into()),
+                metrics,
+            );
+        };
         let pick_elapsed = pick_started.elapsed();
         state
             .telemetry
@@ -589,7 +598,7 @@ impl ProxyHandler {
             &state,
             &service,
             request_path_and_query,
-            target_instance,
+            &target_instance,
             dynamic_prefix.as_deref(),
         );
 

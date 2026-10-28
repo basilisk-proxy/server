@@ -20,6 +20,8 @@ pub struct ServiceBusConnection {
 /// In-memory connection and subscription registry for service-bus clients.
 pub struct ConnectionManager {
     connections: DashMap<String, ServiceBusConnection>,
+    delivery_gate: std::sync::Mutex<()>,
+    draining: dashmap::DashSet<String>,
     next_correlation_id: AtomicI64,
     internal_subscribers: DashMap<String, mpsc::UnboundedSender<ServiceBusEventEnvelope>>,
 
@@ -59,6 +61,8 @@ impl ConnectionManager {
 
         Self {
             connections,
+            delivery_gate: std::sync::Mutex::new(()),
+            draining: dashmap::DashSet::new(),
             next_correlation_id: AtomicI64::new(1),
             internal_subscribers: DashMap::new(),
             internal_rx: tokio::sync::Mutex::new(internal_rx),
@@ -86,6 +90,43 @@ impl ConnectionManager {
         }
         debug!(connection_key = %key, "service bus connection removed");
         self.connections.remove(key);
+        self.draining.remove(key);
+    }
+
+    /// Removes every subscription and acknowledges after previously queued deliveries.
+    /// The delivery gate prevents a publisher with an old subscriber snapshot racing the ACK.
+    pub fn begin_drain(&self, key: &str) {
+        let _gate = self.delivery_gate.lock().unwrap();
+        self.draining.insert(key.to_string());
+        if let Some(mut connection) = self.connections.get_mut(key) {
+            connection.subscriptions.clear();
+            let _ = connection.tx.send(ServiceBusProtocolMessage {
+                r#type: crate::service_bus::contracts::protocol_types::ACK.into(),
+                message: Some("All subscriptions removed; instance draining".into()),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// Removes only the socket session that owns this sender. An old socket closing
+    /// must never remove a newer connection authenticated with the same identity.
+    pub fn remove_connection_if_current(
+        &self,
+        key: &str,
+        sender: &mpsc::UnboundedSender<ServiceBusProtocolMessage>,
+    ) -> bool {
+        if key == basilisk_connection_key() {
+            return false;
+        }
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.connections.entry(key.to_string())
+            && entry.get().tx.same_channel(sender)
+        {
+            entry.remove();
+            self.draining.remove(key);
+            return true;
+        }
+        false
     }
 
     /// Marks a connection as authenticated.
@@ -103,6 +144,10 @@ impl ConnectionManager {
 
     /// Adds topic subscriptions to a connection.
     pub fn add_subscriptions(&self, key: &str, topics: Vec<String>) {
+        let _gate = self.delivery_gate.lock().unwrap();
+        if self.draining.contains(key) {
+            return;
+        }
         if let Some(mut conn) = self.connections.get_mut(key) {
             let mut added = Vec::new();
             for topic in topics {
@@ -155,6 +200,7 @@ impl ConnectionManager {
             .filter(|r| {
                 r.key() != exclude_key
                     && r.value().authenticated
+                    && !self.draining.contains(r.key())
                     && (r.value().subscriptions.contains(&topic.to_string())
                         || r.value().subscriptions.contains(&String::from("*")))
             })
@@ -184,6 +230,7 @@ impl ConnectionManager {
 
     /// Publishes an event to matching internal and external subscribers.
     pub fn publish(&self, event: ServiceBusEventEnvelope, exclude_key: Option<&str>) -> i32 {
+        let _gate = self.delivery_gate.lock().unwrap();
         let mut delivered_count = 0;
         debug!(
             topic = %event.topic,
@@ -218,7 +265,7 @@ impl ConnectionManager {
                     subscriber_connection_key = %sub_key,
                     "service bus publish failed to deliver to subscriber; removing connection"
                 );
-                self.remove_connection(&sub_key);
+                self.remove_connection_if_current(&sub_key, &sub_tx);
             }
         }
         debug!(

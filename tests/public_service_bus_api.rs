@@ -501,3 +501,65 @@ async fn monitoring_enabled_disconnect_does_not_force_immediate_down() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn drain_ack_follows_queued_events_and_blocks_all_future_delivery() {
+    use basilisk::service_bus::{
+        connection_manager::{ConnectionManager, ServiceBusConnection},
+        contracts::ServiceBusEventEnvelope,
+    };
+    let manager = ConnectionManager::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let key = "orders:drain-test";
+    manager.add_connection(
+        key.into(),
+        ServiceBusConnection {
+            service_id: "orders".into(),
+            instance_id: "drain-test".into(),
+            tx,
+            authenticated: true,
+            subscriptions: vec!["*".into()],
+        },
+    );
+    let event = ServiceBusEventEnvelope {
+        event_id: "queued".into(),
+        emitted_at_utc: chrono::Utc::now(),
+        service_id: "sender".into(),
+        instance_id: "sender-1".into(),
+        topic: "updates".into(),
+        message_type: "update".into(),
+        correlation_id: 1,
+        causation_id: None,
+        payload: std::collections::HashMap::new(),
+    };
+    assert_eq!(manager.publish(event.clone(), None), 1);
+    manager.begin_drain(key);
+    assert_eq!(rx.recv().await.unwrap().r#type, "event");
+    assert_eq!(rx.recv().await.unwrap().r#type, "ack");
+    manager.add_subscriptions(key, vec!["updates".into()]);
+    assert_eq!(manager.publish(event, None), 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn stale_socket_cleanup_preserves_replacement_connection() {
+    use basilisk::service_bus::connection_manager::{ConnectionManager, ServiceBusConnection};
+    let manager = ConnectionManager::new();
+    let (old, _) = tokio::sync::mpsc::unbounded_channel();
+    let (new, _) = tokio::sync::mpsc::unbounded_channel();
+    for sender in [old.clone(), new.clone()] {
+        manager.add_connection(
+            "orders:same-id".into(),
+            ServiceBusConnection {
+                service_id: "orders".into(),
+                instance_id: "same-id".into(),
+                tx: sender,
+                authenticated: true,
+                subscriptions: vec![],
+            },
+        );
+    }
+    assert!(!manager.remove_connection_if_current("orders:same-id", &old));
+    assert!(manager.is_authenticated("orders:same-id"));
+    assert!(manager.remove_connection_if_current("orders:same-id", &new));
+}

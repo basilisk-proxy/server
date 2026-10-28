@@ -278,6 +278,11 @@ async fn handle_client(
                                     }
                                 }
                     }
+                    protocol_types::DRAIN => {
+                        if let Some(key) = &connection_key {
+                            connection_manager.begin_drain(key);
+                        }
+                    }
                     protocol_types::FORWARD => {
                         if let Some(key) = &connection_key {
                             if connection_manager.is_authenticated(key) {
@@ -337,7 +342,8 @@ async fn handle_client(
     }
 
     if let Some(key) = connection_key {
-        if bus_monitor.is_enabled(&bus_config) {
+        let removed = connection_manager.remove_connection_if_current(&key, &tx);
+        if removed && bus_monitor.is_enabled(&bus_config) {
             let identity = connected_identity
                 .clone()
                 .or_else(|| connection_manager.get_connection_info(&key));
@@ -345,7 +351,6 @@ async fn handle_client(
                 bus_monitor.on_bus_disconnect(&registry, &sid, &iid, &bus_config);
             }
         }
-        connection_manager.remove_connection(&key);
     }
     debug!(peer = ?peer, "service bus client session ended");
     Ok(())

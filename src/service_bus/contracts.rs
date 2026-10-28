@@ -15,6 +15,8 @@ pub const BASILISK_METRICS_DISTRIBUTION_TOPIC: &str = "basilisk.metrics.distribu
 
 /// Wire-level `type` values used by the service-bus protocol.
 pub mod protocol_types {
+    /// Remove all subscriptions and acknowledge after already queued deliveries.
+    pub const DRAIN: &str = "drain";
     pub const CONNECT: &str = "connect";
     pub const SUBSCRIBE: &str = "subscribe";
     pub const UNSUBSCRIBE: &str = "unsubscribe";

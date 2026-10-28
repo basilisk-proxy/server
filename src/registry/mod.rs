@@ -8,15 +8,35 @@ pub use maintenance::run_maintenance;
 use crate::models::{InstanceStatus, RegistrationRequest, ServiceDefinition, ServiceInstance};
 use chrono::Utc;
 use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct ServiceRegistry {
     services: DashMap<String, ServiceDefinition>,
+    http_work: Mutex<HashMap<String, Arc<HttpActivity>>>,
     path_owners: DashMap<String, String>,
     metrics_heartbeat: DashMap<String, MetricsHeartbeatState>,
     proxy_failure_counts: DashMap<String, u32>,
+}
+
+#[derive(Default)]
+struct HttpActivity {
+    active: std::sync::atomic::AtomicUsize,
+    changed: Notify,
+}
+/// Tracks a proxy request from selection through response-body completion.
+pub struct HttpWork(Arc<HttpActivity>);
+impl Drop for HttpWork {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.changed.notify_waiters();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +67,7 @@ impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
             services: DashMap::new(),
+            http_work: Mutex::new(HashMap::new()),
             path_owners: DashMap::new(),
             metrics_heartbeat: DashMap::new(),
             proxy_failure_counts: DashMap::new(),
@@ -161,33 +182,55 @@ impl ServiceRegistry {
         }
     }
 
-    /// Removes an instance from a service definition.
-    pub async fn deregister(&self, service_id: &str, instance_id: &str) -> bool {
-        info!(service_id = %service_id, instance_id = %instance_id, "registry deregister attempt");
-        if let Some(mut service) = self.services.get_mut(service_id) {
-            let removed = service.instances.remove(instance_id).is_some();
-            if removed {
-                self.metrics_heartbeat
-                    .remove(&metrics_key(service_id, instance_id));
-                self.proxy_failure_counts
-                    .remove(&metrics_key(service_id, instance_id));
-                info!(
-                    service_id = %service_id,
-                    instance_id = %instance_id,
-                    remaining_instances = service.instances.len(),
-                    "registry deregister succeeded"
-                );
-            } else {
-                warn!(
-                    service_id = %service_id,
-                    instance_id = %instance_id,
-                    "registry deregister target instance not found"
-                );
-            }
-            return removed;
+    /// Acquires a request lease atomically with checking current registry membership.
+    pub fn acquire_http(&self, service_id: &str, instance_id: &str) -> Option<HttpWork> {
+        let mut work = self.http_work.lock().unwrap();
+        if !self
+            .services
+            .get(service_id)?
+            .instances
+            .contains_key(instance_id)
+        {
+            return None;
         }
-        warn!(service_id = %service_id, instance_id = %instance_id, "registry deregister target service not found");
-        false
+        let activity = work
+            .entry(metrics_key(service_id, instance_id))
+            .or_default()
+            .clone();
+        activity
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(HttpWork(activity))
+    }
+
+    /// Stops selection of this instance, then waits for all admitted HTTP requests.
+    pub async fn deregister(&self, service_id: &str, instance_id: &str) -> bool {
+        let (removed, activity) = {
+            let mut work = self.http_work.lock().unwrap();
+            let removed = self
+                .services
+                .get_mut(service_id)
+                .is_some_and(|mut service| service.instances.remove(instance_id).is_some());
+            (removed, work.remove(&metrics_key(service_id, instance_id)))
+        };
+        if removed {
+            self.metrics_heartbeat
+                .remove(&metrics_key(service_id, instance_id));
+            self.proxy_failure_counts
+                .remove(&metrics_key(service_id, instance_id));
+        }
+        if let Some(activity) = activity {
+            loop {
+                let changed = activity.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if activity.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        }
+        removed
     }
 
     /// Records one metrics heartbeat sample emitted by an instance.
@@ -348,6 +391,7 @@ impl ServiceRegistry {
 
     /// Removes down instances that exceeded the configured timeout.
     pub fn remove_stale_instances(&self, timeout: Duration) {
+        let mut http_work = self.http_work.lock().unwrap();
         let now = Utc::now();
         for mut service in self.services.iter_mut() {
             service.instances.retain(|_, instance| {
@@ -361,6 +405,7 @@ impl ServiceRegistry {
                             timeout_secs = timeout.as_secs(),
                             "registry stale instance removed"
                         );
+                        http_work.remove(&metrics_key(&instance.service_id, &instance.instance_id));
                         self.metrics_heartbeat
                             .remove(&metrics_key(&instance.service_id, &instance.instance_id));
                         self.proxy_failure_counts

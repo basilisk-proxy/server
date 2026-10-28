@@ -1131,3 +1131,15 @@ This error occurs when request headers exceed the HTTP server's size limit (hype
     - Combine repeated headers using proper HTTP semantics (comma-separated values)
     - Deduplicate forwarded-for chains
     - Example: limit `X-Forwarded-For` chain length to max five hops
+
+
+### Instance drain barriers
+
+Registry instance deletion removes the instance from selection immediately and
+waits for all proxy HTTP request leases, including full upstream response bodies.
+Stale cached registry snapshots cannot acquire new leases after removal.
+The service-bus `drain` command atomically removes every subscription and queues
+an ACK after previously queued event/forward deliveries. Publishers and drain
+share an admission gate, so none can enqueue to that instance after the ACK.
+Other instances of the same service continue serving throughout the drain.
+Clients finish handlers already delivered before closing the connection.
